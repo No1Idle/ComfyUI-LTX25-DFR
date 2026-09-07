@@ -1,3 +1,5 @@
+import math
+
 import torch
 import comfy.utils
 
@@ -91,6 +93,63 @@ def _encode_single_image_for_latent(vae, image, samples):
     encoded = encoded.to(device=samples.device, dtype=samples.dtype)
 
     return encoded, int(time_scale_factor)
+
+
+class LTXResolutionFromImage:
+    """Resolve pixel dimensions on the grid required by spatial upscaling."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "spatial_upscale": ("INT", {
+                    "default": 1, "min": 1, "max": 4, "step": 1,
+                    "tooltip": "1: multiples of 32; 2: multiples of 64; 4: multiples of 128.",
+                }),
+                "target_megapixels": ("FLOAT", {
+                    "default": 1.0, "min": 0.01, "max": 64.0, "step": 0.01,
+                    "tooltip": "Target pixel area in MP (1 MP = 1024 x 1024 pixels, matching this project's benchmarks).",
+                }),
+                "use_current_image_resolution": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Use the input image's pixel area instead of target_megapixels. Dimensions are still grid-aligned.",
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("width", "height")
+    FUNCTION = "resolve"
+    CATEGORY = "LTX/Utilities"
+    DESCRIPTION = (
+        "Compute LTX-compatible pixel width and height from an image's aspect ratio. "
+        "Scale to the requested area, then round each dimension to the nearest multiple "
+        "of 32 times spatial_upscalings (minimum one grid unit). Grid rounding may "
+        "slightly change the aspect ratio and pixel area. Does not resize the image."
+    )
+
+    def resolve(self, image, spatial_upscale, target_megapixels,
+                use_current_image_resolution):
+        if not torch.is_tensor(image) or image.ndim != 4 or any(d < 1 for d in image.shape):
+            raise ValueError("image must be a non-empty ComfyUI IMAGE tensor [B,H,W,C].")
+        if spatial_upscale not in (1, 2, 4):
+            raise ValueError("spatial_upscale must be 1, 2, or 4.")
+
+        source_height, source_width = image.shape[1:3]
+        if use_current_image_resolution:
+            target_area = source_width * source_height
+        else:
+            megapixels = float(target_megapixels)
+            if not math.isfinite(megapixels) or megapixels <= 0:
+                raise ValueError("target_megapixels must be finite and greater than zero.")
+            target_area = megapixels * 1024 * 1024
+
+        scale = math.sqrt(target_area / (source_width * source_height))
+        multiple = 32 * int(spatial_upscale)
+        width = max(1, math.floor(source_width * scale / multiple + 0.5)) * multiple
+        height = max(1, math.floor(source_height * scale / multiple + 0.5)) * multiple
+        return (width, height)
 
 
 class CropImageToMaskBBox:
@@ -275,10 +334,12 @@ def _split_image_batch(images):
 
 
 NODE_CLASS_MAPPINGS = {
+    "LTXResolutionFromImage": LTXResolutionFromImage,
     "CropImageToMaskBBox_Current": CropImageToMaskBBox,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LTXResolutionFromImage": "LTX: Resolution From Image",
     "CropImageToMaskBBox_Current": "Crop Image to Mask Bounding Box",
 }
 
