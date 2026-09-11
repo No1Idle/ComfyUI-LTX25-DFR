@@ -22,6 +22,7 @@ import torch
 from .audio_state import get_audio_official_state, validate_audio_state_against_video
 from .dfr_noiser import NOISER_METADATA_KEY
 from .latent_state import get_official_state
+from .frame_rate import official_conditioning_fps, model_video_positions
 
 
 AV_MODEL_INPUT_VERSION = 1
@@ -186,6 +187,7 @@ def materialize_stage1_av_model_input(
     )
 
     fps = float(v_tokens.get("fps") or v_state.get("fps") or alignment["fps"])
+    video_positions = model_video_positions(video_positions, fps)
     duration_seconds = float(a_state["duration_seconds"])
     video_range = (0, video_token_count)
     audio_range = (video_token_count, total_token_count)
@@ -208,7 +210,7 @@ def materialize_stage1_av_model_input(
         batch_size=batch,
         video_token_range=video_range,
         audio_token_range=audio_range,
-        frame_rate=fps,
+        frame_rate=official_conditioning_fps(fps),
         duration_seconds=duration_seconds,
         video_base_shape=tuple(int(x) for x in v_state["base_shape"]),
         audio_base_shape=tuple(int(x) for x in a_state["base_shape"]),

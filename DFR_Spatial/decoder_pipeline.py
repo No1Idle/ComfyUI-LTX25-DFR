@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any
 
 import torch
+
+from .decoder_attention_memory import decoder_attention_chunks
+from .decoder_geometry_cache import decoder_geometry_cache
+from .decoder_timing import DecodeTimings
 
 from .decoder_det_dual_stream_exact import (
     execute_exact_deterministic_stages,
@@ -34,6 +39,7 @@ from .dfr_layout import validate_layout
 from .stage2_output import prepare_official_final_decode
 from .stage2_handoff import DFRStage2Handoff, HANDOFF_VERSION
 from .stage2_result import require_stage2_result_handoff
+from .decoder_memory import prepare_decoder_memory
 
 
 logger = logging.getLogger(__name__)
@@ -178,85 +184,120 @@ def _decode_keyframe_aware_video(  # noqa: PLR0913
     tile_frames: int = 104,
     tile_height: int = 416,
     tile_width: int = 544,
+    attention_chunks: int = 1,
+    auto_tile_multiplier: float = 1.0,
     log_stage: str = "Stage 2",
 ) -> torch.Tensor:
-    substrate, _ = build_decoder_keyframe_substrate(
-        vae,
-        decoder_handoff,
-        final_decode_keyframes,
-        dfr_layout,
-        collect_diagnostics=False,
-    )
-    checkpoint_weights, _ = extract_decoder_keyframe_checkpoint_weights(substrate, str(vae_name))
-    joint_attention, _ = prepare_joint_decoder_attention(substrate, checkpoint_weights)
-    deterministic_context, _ = prepare_deterministic_decoder_keyframe_context(
-        vae,
-        substrate,
-        checkpoint_weights,
-        joint_attention,
-        final_decode_keyframes,
-        dfr_layout,
-    )
-    preflight, _ = prepare_official_deterministic_stage_preflight(
-        vae,
-        deterministic_context,
-        collect_diagnostics=False,
-    )
-    deterministic_port, _ = prepare_exact_deterministic_dual_stream_port(preflight, joint_attention)
-    deterministic_execution, _ = execute_exact_deterministic_stages(
-        vae,
-        final_video_latent,
-        deterministic_context,
-        deterministic_port,
-        collect_diagnostics=False,
-    )
-    stage5_port, _ = prepare_exact_stage5_dual_stream_port(deterministic_port)
+    timings = DecodeTimings(vae.device)
+    with decoder_attention_chunks(attention_chunks), decoder_geometry_cache() as geometry_cache:
+        # Do this before deterministic stages allocate the large Stage-4 feature,
+        # and before automatic tiling measures the remaining device budget.
+        prepare_decoder_memory(vae)
+        substrate, _ = build_decoder_keyframe_substrate(
+            vae,
+            decoder_handoff,
+            final_decode_keyframes,
+            dfr_layout,
+            collect_diagnostics=False,
+        )
+        checkpoint_weights, _ = extract_decoder_keyframe_checkpoint_weights(substrate, str(vae_name))
+        joint_attention, _ = prepare_joint_decoder_attention(substrate, checkpoint_weights)
+        deterministic_context, _ = prepare_deterministic_decoder_keyframe_context(
+            vae,
+            substrate,
+            checkpoint_weights,
+            joint_attention,
+            final_decode_keyframes,
+            dfr_layout,
+        )
+        preflight, _ = prepare_official_deterministic_stage_preflight(
+            vae,
+            deterministic_context,
+            collect_diagnostics=False,
+        )
+        deterministic_port, _ = prepare_exact_deterministic_dual_stream_port(preflight, joint_attention)
+        with timings.phase("deterministic_stages_1_3"):
+            deterministic_execution, _ = execute_exact_deterministic_stages(
+                vae,
+                final_video_latent,
+                deterministic_context,
+                deterministic_port,
+                collect_diagnostics=False,
+            )
+        stage5_port, _ = prepare_exact_stage5_dual_stream_port(deterministic_port)
 
-    if bool(use_auto_tiling):
-        schedule, _ = prepare_official_auto_tiled_decode_schedule(
+        # Stage 5 is the decode bottleneck and benefits directly from workspace
+        # headroom. Keep the complete Stage-4 video/keyframe feature volumes on
+        # CPU and upload only the spatial/temporal slice needed by each tile.
+        stage4_video_bytes = (
+            deterministic_execution.stage4_input_video.numel()
+            * deterministic_execution.stage4_input_video.element_size()
+        )
+        stage4_keyframe_bytes = (
+            deterministic_execution.stage4_input_keyframes.numel()
+            * deterministic_execution.stage4_input_keyframes.element_size()
+        )
+        with timings.phase("feature_offload"):
+            deterministic_execution = replace(
+                deterministic_execution,
+                stage4_input_video=deterministic_execution.stage4_input_video.to("cpu"),
+                stage4_input_keyframes=deterministic_execution.stage4_input_keyframes.to("cpu"),
+            )
+        import comfy.model_management as model_management
+        model_management.soft_empty_cache()
+        logger.info(
+            "[LTX DFR decode memory] Stage-4 video+keyframes offloaded to CPU: %.2f GiB + %.2f GiB; "
+            "uploading only current tile slices",
+            stage4_video_bytes / (1 << 30),
+            stage4_keyframe_bytes / (1 << 30),
+        )
+
+        if bool(use_auto_tiling):
+            schedule, _ = prepare_official_auto_tiled_decode_schedule(
+                vae, deterministic_execution, deterministic_context,
+                auto_tile_multiplier=auto_tile_multiplier,
+            )
+            tiling_mode = "auto_cpu_stage4"
+        else:
+            temporal_overlap, spatial_overlap = _required_manual_overlaps(vae)
+            schedule, _ = prepare_official_tiled_decode_schedule(
+                vae,
+                deterministic_execution,
+                deterministic_context,
+                tile_frames=int(tile_frames),
+                temporal_overlap=int(temporal_overlap),
+                tile_height=int(tile_height),
+                tile_width=int(tile_width),
+                spatial_overlap=int(spatial_overlap),
+            )
+            tiling_mode = "manual"
+
+        images, _execution, _ = execute_official_tiled_decode(
             vae,
             deterministic_execution,
             deterministic_context,
+            decoder_handoff,
+            stage5_port,
+            schedule,
+            collect_diagnostics=False,
+            timings=timings,
         )
-        tiling_mode = "auto"
-    else:
-        temporal_overlap, spatial_overlap = _required_manual_overlaps(vae)
-        schedule, _ = prepare_official_tiled_decode_schedule(
-            vae,
-            deterministic_execution,
-            deterministic_context,
-            tile_frames=int(tile_frames),
-            temporal_overlap=int(temporal_overlap),
-            tile_height=int(tile_height),
-            tile_width=int(tile_width),
-            spatial_overlap=int(spatial_overlap),
+        config = schedule.tiling_config
+        logger.info(
+            "LTX Spatial DFR %s video decode: tiling=%s, frames=%d/%d, height=%d/%d, width=%d/%d, tiles=%d, groups=%d",
+            log_stage,
+            tiling_mode,
+            int(config.frames.tile_size),
+            int(config.frames.overlap),
+            int(config.height.tile_size),
+            int(config.height.overlap),
+            int(config.width.tile_size),
+            int(config.width.overlap),
+            int(schedule.total_tiles),
+            int(schedule.temporal_groups),
         )
-        tiling_mode = "manual"
-
-    images, _execution, _ = execute_official_tiled_decode(
-        vae,
-        deterministic_execution,
-        deterministic_context,
-        decoder_handoff,
-        stage5_port,
-        schedule,
-        collect_diagnostics=False,
-    )
-    config = schedule.tiling_config
-    logger.info(
-        "LTX Spatial DFR %s video decode: tiling=%s, frames=%d/%d, height=%d/%d, width=%d/%d, tiles=%d, groups=%d",
-        log_stage,
-        tiling_mode,
-        int(config.frames.tile_size),
-        int(config.frames.overlap),
-        int(config.height.tile_size),
-        int(config.height.overlap),
-        int(config.width.tile_size),
-        int(config.width.overlap),
-        int(schedule.total_tiles),
-        int(schedule.temporal_groups),
-    )
-    return images
+        timings.report(log_stage, geometry_cache)
+        return images
 
 
 def decode_spatial_dfr_video(  # noqa: PLR0913
@@ -270,6 +311,8 @@ def decode_spatial_dfr_video(  # noqa: PLR0913
     tile_frames: int = 104,
     tile_height: int = 416,
     tile_width: int = 544,
+    attention_chunks: int = 1,
+    auto_tile_multiplier: float = 1.0,
 ) -> torch.Tensor:
     """Run the complete validated final Stage-2 Spatial-DFR decode."""
     final_video_latent = _validated_final_video_latent(
@@ -289,6 +332,8 @@ def decode_spatial_dfr_video(  # noqa: PLR0913
         tile_frames=tile_frames,
         tile_height=tile_height,
         tile_width=tile_width,
+        attention_chunks=attention_chunks,
+        auto_tile_multiplier=auto_tile_multiplier,
         log_stage="Stage 2",
     )
 
@@ -304,6 +349,8 @@ def decode_stage1_spatial_dfr_video(  # noqa: PLR0913
     tile_frames: int = 104,
     tile_height: int = 416,
     tile_width: int = 544,
+    attention_chunks: int = 1,
+    auto_tile_multiplier: float = 1.0,
 ) -> torch.Tensor:
     """Decode a keyframe-aware Stage-1 preview from its exact AV RNG boundary."""
     final_video_latent, decoder_handoff, final_decode_keyframes = _prepare_stage1_decoder_inputs(
@@ -322,5 +369,7 @@ def decode_stage1_spatial_dfr_video(  # noqa: PLR0913
         tile_frames=tile_frames,
         tile_height=tile_height,
         tile_width=tile_width,
+        attention_chunks=attention_chunks,
+        auto_tile_multiplier=auto_tile_multiplier,
         log_stage="Stage 1 preview",
     )

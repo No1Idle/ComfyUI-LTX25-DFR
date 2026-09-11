@@ -24,6 +24,8 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .decoder_geometry_cache import cached_geometry
+
 from .decoder_keyframe_substrate import DFRDecoderKeyframeSubstrate
 from .decoder_keyframe_checkpoint import DFRDecoderKeyframeCheckpointWeights
 
@@ -77,6 +79,7 @@ def _nearest_slots(
     return chosen
 
 
+@cached_geometry
 def video_keyframe_slots(
     keyframe_times: torch.Tensor,
     keyframe_valid: torch.Tensor,
@@ -87,6 +90,7 @@ def video_keyframe_slots(
     return _nearest_slots(query, keyframe_times.to(torch.float32), keyframe_valid, num_slots)
 
 
+@cached_geometry
 def keyframe_video_slots(
     keyframe_times: torch.Tensor,
     keyframe_valid: torch.Tensor,
@@ -899,7 +903,15 @@ def prepare_joint_decoder_attention(
     if not decoder_keyframe_substrate.keyframe_channels_match_expected:
         raise ValueError("U3.4b2 requires the validated 128-channel keyframe substrate.")
     if not decoder_keyframe_checkpoint_weights.checkpoint_has_type_emb:
-        raise ValueError("U3.4b2 requires the real trained decoder.type_emb from the LTX-2.5 checkpoint.")
+        raise ValueError(
+            f"The selected vae_name {decoder_keyframe_checkpoint_weights.checkpoint_name!r} "
+            "does not contain a recognized trained decoder.type_emb tensor. "
+            "Set vae_name to the same LTX-2.5 video VAE checkpoint used by the working "
+            "Spatial DFR Video Decode node and the connected VAE loader. The VAE wire "
+            "does not automatically select this separate checkpoint field. "
+            f"Inspected file: {decoder_keyframe_checkpoint_weights.checkpoint_path}. "
+            "Expected key: decoder.type_emb or vae.decoder.type_emb."
+        )
     shape = tuple(int(x) for x in decoder_keyframe_checkpoint_weights.type_emb.shape)
     if shape != (decoder_keyframe_substrate.expected_keyframe_channels,):
         raise ValueError(

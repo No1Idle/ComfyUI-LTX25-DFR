@@ -8,12 +8,15 @@ then executes the official 16,384-token tiled SwiGLU residual.
 
 from __future__ import annotations
 
+import logging
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from .decoder_attention_memory import choose_attention_chunks
 from .decoder_det_dual_stream_exact import _forward_attention_with_keyframes_exact
 from .decoder_stage5_swiglu_chunked import residual_modulating_mlp_exact
 
@@ -278,6 +281,7 @@ def run_w_chunked_joint_residual_exact(
         keyframe_x[:, :, :, core_start:core_end, :].add_(
             keyframe_out[:, :, :, halo : halo + core_len, :]
         )
+        del buf, keyframe_buf, out, keyframe_out, w_pos
     return x, keyframe_x
 
 
@@ -301,36 +305,41 @@ def forward_stage5_chunked_block_exact(
     drop_leading_frame: bool,
     num_slots: int,
     w_chunks: int = OFFICIAL_STAGE5_W_CHUNKS,
+    timings: Any = None,
+    attention_chunks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    phase = timings.phase if timings is not None else lambda name: nullcontext()
     if len(modulation) != 7:
         raise ValueError(f"Expected 7 AdaLN chunks, got {len(modulation)}.")
     table = block.scale_shift_table
     chunks = [modulation[i] + table[i].view(1, 1, 1, 1, -1) for i in range(7)]
     scale_msa, shift_msa, _gate_msa, scale_mlp, shift_mlp, _gate_mlp, _extra = chunks
 
-    inject_deferred_context_exact(
-        video_x,
-        video_stage4_feat,
-        upsample,
-        block.context_proj,
-        w_chunks=int(w_chunks),
-        drop_leading_frame=bool(drop_leading_frame),
-    )
-    inject_deferred_keyframe_context_exact(
-        keyframe_x,
-        keyframe_stage4_feat,
-        upsample,
-        block.context_proj,
-        w_chunks=int(w_chunks),
-    )
+    with phase("stage5.context"):
+        inject_deferred_context_exact(
+            video_x,
+            video_stage4_feat,
+            upsample,
+            block.context_proj,
+            w_chunks=int(w_chunks),
+            drop_leading_frame=bool(drop_leading_frame),
+        )
+        inject_deferred_keyframe_context_exact(
+            keyframe_x,
+            keyframe_stage4_feat,
+            upsample,
+            block.context_proj,
+            w_chunks=int(w_chunks),
+        )
 
     def attend(
         video_slab: torch.Tensor,
         keyframe_slab: torch.Tensor,
         width_positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        video_y = _modulate(block.norm1(video_slab), scale_msa, shift_msa)
-        keyframe_y = _modulate(block.norm1(keyframe_slab), scale_msa, shift_msa)
+        with phase("stage5.attention.normalization"):
+            video_y = _modulate(block.norm1(video_slab), scale_msa, shift_msa)
+            keyframe_y = _modulate(block.norm1(keyframe_slab), scale_msa, shift_msa)
         return _forward_attention_with_keyframes_exact(
             comfy_na,
             comfy_kitchen,
@@ -342,32 +351,35 @@ def forward_stage5_chunked_block_exact(
             num_slots=int(num_slots),
             width_positions=width_positions,
             separate_qkv=True,
+            timings=timings,
         )
 
-    video_x, keyframe_x = run_w_chunked_joint_residual_exact(
-        video_x,
-        keyframe_x,
-        w_chunks=int(w_chunks),
-        halo=int(block.attn.kernel_size[2]) // 2,
-        attention_fn=attend,
-    )
-    video_x = residual_modulating_mlp_exact(
-        video_x,
-        block.mlp,
-        block.norm2,
-        scale_mlp,
-        shift_mlp,
-    )
-    keyframe_x = residual_modulating_mlp_exact(
-        keyframe_x,
-        block.mlp,
-        block.norm2,
-        scale_mlp,
-        shift_mlp,
-    )
-    keyframe_x.mul_(
-        keyframe_valid.to(device=keyframe_x.device, dtype=keyframe_x.dtype)[None, :, None, None, None]
-    )
+    with phase("stage5.attention"):
+        video_x, keyframe_x = run_w_chunked_joint_residual_exact(
+            video_x,
+            keyframe_x,
+            w_chunks=int(attention_chunks if attention_chunks is not None else w_chunks),
+            halo=int(block.attn.kernel_size[2]) // 2,
+            attention_fn=attend,
+        )
+    with phase("stage5.feed_forward"):
+        video_x = residual_modulating_mlp_exact(
+            video_x,
+            block.mlp,
+            block.norm2,
+            scale_mlp,
+            shift_mlp,
+        )
+        keyframe_x = residual_modulating_mlp_exact(
+            keyframe_x,
+            block.mlp,
+            block.norm2,
+            scale_mlp,
+            shift_mlp,
+        )
+        keyframe_x.mul_(
+            keyframe_valid.to(device=keyframe_x.device, dtype=keyframe_x.dtype)[None, :, None, None, None]
+        )
     return video_x, keyframe_x
 
 
@@ -395,8 +407,10 @@ def forward_stage5_chunked_step_exact(
     w_chunks: int = OFFICIAL_STAGE5_W_CHUNKS,
     collect_diagnostics: bool = True,
     return_keyframes: bool = True,
+    timings: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, float, int]:
     """Official ``forward_diff_step_deferred_with_keyframes`` on Comfy weights."""
+    phase = timings.phase if timings is not None else lambda name: nullcontext()
     video_x = video_x.contiguous()
     keyframe_x = keyframe_x.contiguous()
     video_stage4_feat = video_stage4_feat.contiguous()
@@ -410,6 +424,22 @@ def forward_stage5_chunked_step_exact(
     invalid_zero = 0.0
     blocks_executed = 0
     upsample = decoder.upsamples[3]
+    attention_chunks = choose_attention_chunks(
+        video_x, keyframe_x,
+        max(int(block.attn.kernel_size[2]) // 2 for block in decoder.diff_blocks),
+        default=int(w_chunks),
+    )
+    if timings is not None:
+        timings.attention_chunk_counts[attention_chunks] += 1
+        choices = getattr(timings, 'attention_chunk_choices', None)
+        if choices is None:
+            choices = timings.attention_chunk_choices = set()
+        if attention_chunks not in choices:
+            logging.getLogger(__name__).info(
+                '[LTX DFR decode attention] width_chunks=%d; context_chunks=%d; decode setting (legacy callers may use workspace selection)',
+                attention_chunks, int(w_chunks),
+            )
+            choices.add(attention_chunks)
     for block in decoder.diff_blocks:
         video_x, keyframe_x = forward_stage5_chunked_block_exact(
             comfy_na,
@@ -426,6 +456,8 @@ def forward_stage5_chunked_step_exact(
             drop_leading_frame=bool(drop_leading_frame),
             num_slots=int(num_slots),
             w_chunks=int(w_chunks),
+            timings=timings,
+            attention_chunks=attention_chunks,
         )
         blocks_executed += 1
         if collect_diagnostics and bool((~keyframe_valid).any()):
@@ -433,9 +465,11 @@ def forward_stage5_chunked_step_exact(
             if invalid.numel():
                 invalid_zero = max(invalid_zero, float(invalid.float().abs().max().item()))
 
-    keyframe_pixels = _pixels_from_stage5(comfy_na, decoder, keyframe_x) if return_keyframes else None
+    with phase("stage5.output_projection"):
+        keyframe_pixels = _pixels_from_stage5(comfy_na, decoder, keyframe_x) if return_keyframes else None
+        video_pixels = _pixels_from_stage5(comfy_na, decoder, video_x)
     return (
-        _pixels_from_stage5(comfy_na, decoder, video_x),
+        video_pixels,
         keyframe_pixels,
         float(invalid_zero),
         int(blocks_executed),

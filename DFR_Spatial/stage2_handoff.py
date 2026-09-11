@@ -38,6 +38,9 @@ class DFRStage2Handoff:
     audio_token_shape_at_stage1_noise: tuple[int, ...]
     fps: float
     duration_seconds: float
+    temporal_seams: tuple[int, ...] = ()
+    temporal_tiles: int = 1
+    dfr_layout: dict[str, Any] | None = None
 
 
 HANDOFF_VERSION = 1
@@ -150,6 +153,7 @@ def prepare_stage2_handoff(
         audio_token_shape_at_stage1_noise=tuple(int(x) for x in am.get("token_shape", ())),
         fps=fps,
         duration_seconds=duration_seconds,
+        dfr_layout=final_video_state.get("dfr_layout"),
     )
 
     report = (
@@ -205,6 +209,7 @@ def prepare_stage1_handoff(
         audio_token_shape_at_stage1_noise=tuple(int(x) for x in am.get("token_shape", ())),
         fps=float(video_state.get("fps") or 24.0),
         duration_seconds=float(audio_state.get("duration_seconds", 0.0)),
+        dfr_layout=final_video_state.get("dfr_layout"),
     )
 
 

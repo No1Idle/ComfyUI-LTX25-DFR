@@ -409,6 +409,14 @@ def joint_na3d(
 
     hd_pad = max(16, triton.next_power_of_2(head_dim))
     block_q = 16
+    # RTX 4070 Ti benchmark: ~12% lower joint-attention time with identical
+    # tested BF16 outputs. Keep the original launch for other formats/devices.
+    num_warps = 2 if (
+        q.dtype == torch.bfloat16
+        and head_dim == 64
+        and (kernel_t, kernel_h, kernel_w) == (11, 11, 11)
+        and torch.cuda.get_device_capability(q.device) == (8, 9)
+    ) else 4
     block_k = max(16, min(32, triton.next_power_of_2(min(width, block_q + kernel_w))))
     is_fp32 = q.dtype == torch.float32
     strides = (q.stride(0), q.stride(1), q.stride(2), q.stride(3), q.stride(4))
@@ -439,7 +447,7 @@ def joint_na3d(
         block_q=block_q,
         block_k=block_k,
         is_fp32=is_fp32,
-        num_warps=4,
+        num_warps=num_warps,
     )
     _joint_keyframe_kernel[(triton.cdiv(width, block_q), height, planes * bn_count)](
         keyframe_q,
@@ -464,6 +472,6 @@ def joint_na3d(
         block_q=block_q,
         block_k=block_k,
         is_fp32=is_fp32,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return video_out, keyframe_out

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .dfr_layout import layout_from_handoff
+
 import torch
 
 from .dfr_layout import (
@@ -90,6 +92,7 @@ from .stage2_handoff import (
 
 from .stage2_spatial import (
     prepare_stage2_spatial_upscale_from_handoff,
+    prepare_stage2_spatial_upscale_from_stage2_result_for_test,
     validate_stage2_spatial_upscale,
 )
 
@@ -1658,6 +1661,58 @@ class LTXDFRRunStage2SpatialUpscale:
         )
 
 
+class LTXDFRRunModularStage2SpatialUpscale:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "source_handoff": ("LTX_DFR_STAGE2_HANDOFF,LTX_DFR_STAGE2_RESULT_HANDOFF,LTX_DFR_TEMPORAL_HANDOFF",),
+            "upscale_model": ("LATENT_UPSCALE_MODEL",), "vae": ("VAE",),
+        }, "optional": {
+            "dfr_layout": ("LTX_DFR_LAYOUT", {"tooltip":"Only needed for older Stage 1/Stage 2 handoffs without embedded layout. Current handoffs carry it automatically; temporal sources derive it internally."}),
+        }}
+    RETURN_TYPES = ("LTX_DFR_UPSCALED_STAGE1_HANDOFF", "LATENT", "LTX_DFR_LAYOUT", "FLOAT")
+    RETURN_NAMES = ("upscaled_stage_1_handoff", "upscaled_video_latent", "dfr_layout", "fps")
+    FUNCTION = "run"
+    CATEGORY = "LTX/DFR Spatial/03 - Stage 2"
+    DESCRIPTION = "Spatial x2 from Stage 1, completed Stage 2, or a completed temporal round. Feed the outputs to the existing Stage 2 conditioning and AV loop. Use the returned layout for conditioning, output and decode. Reapply user images at the new resolution. Preserves source audio, FPS, duration and RNG continuation."
+    def run(self, source_handoff, upscale_model, vae, dfr_layout=None):
+        from .modular_stage2 import run_modular_spatial_upscale
+        return run_modular_spatial_upscale(source_handoff, upscale_model, vae, dfr_layout)
+
+
+class LTXDFRRunStage2SpatialUpscaleFromStage2HandoffTest:
+    """TEST ONLY: run another native x2 spatial pass from a completed Stage-2 handoff."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "stage_2_handoff": ("LTX_DFR_STAGE2_RESULT_HANDOFF",),
+                "upscale_model": ("LATENT_UPSCALE_MODEL",),
+                "vae": ("VAE",),
+            }
+        }
+
+    RETURN_TYPES = ("LTX_DFR_UPSCALED_STAGE1_HANDOFF", "LATENT")
+    RETURN_NAMES = ("upscaled_stage_1_handoff", "upscaled_video_latent")
+    FUNCTION = "run"
+    CATEGORY = "LTX/DFR Spatial/03 - Stage 2"
+    DESCRIPTION = (
+        "TEST PURPOSE ONLY. Accepts the completed stage_2_handoff from 'Run Stage 2 AV Loop', "
+        "adapts its Stage-2 video, generated keyframes and continued RNG state into the existing "
+        "Stage-1-shaped handoff, then runs the exact same native x2 latent upscaler used by the normal "
+        "Stage-2 spatial path. Stage-1 audio is intentionally preserved. This is an experimental wiring "
+        "shortcut for testing a third spatial refinement stage, not a clean generalized multi-stage API."
+    )
+
+    def run(self, stage_2_handoff, upscale_model, vae):
+        return prepare_stage2_spatial_upscale_from_stage2_result_for_test(
+            stage_2_handoff,
+            upscale_model,
+            vae,
+        )
+
+
 class LTXDFRValidateStage2SpatialUpscale:
     """Validate Stage-2B native latent upscaling and audio passthrough."""
 
@@ -1842,7 +1897,6 @@ class LTXDFRFinalizeStage2DFRConditioning:
                         )
                     },
                 ),
-                "dfr_layout": ("LTX_DFR_LAYOUT",),
             }
         }
 
@@ -1857,7 +1911,8 @@ class LTXDFRFinalizeStage2DFRConditioning:
         "reserved half-resolution Stage-1 video at the official x2 reference factor. No LoRA/model/noising occurs here."
     )
 
-    def finalize(self, upscaled_stage_1_handoff, detailing_spec, video_after_user_conditions, dfr_layout):
+    def finalize(self, upscaled_stage_1_handoff, detailing_spec, video_after_user_conditions):
+        dfr_layout = layout_from_handoff(upscaled_stage_1_handoff)
         stage_2_video_state = assemble_stage2_conditioning_from_upscaled_handoff(
             upscaled_stage_1_handoff=upscaled_stage_1_handoff,
             detailing_spec=detailing_spec,
@@ -2518,6 +2573,10 @@ class LTXDFRRunStage2AVLoop:
                 ),
             },
             "optional": {
+                "compact_timesteps": ("BOOLEAN", {"default": True, "tooltip": "Store repeated video timestep conditioning once with exact token indices. Disable to use native preparation. Batch >1 and highly varying timesteps use the native fallback."}),
+                "output_chunk_tokens": ("INT", {"default": 4096, "min": 0, "max": 65536, "step": 1024, "tooltip": "Chunk video output modulation/projection to reduce peak VRAM. 0 disables. Timestep conditioning is unchanged."}),
+                "diagnose_memory": ("BOOLEAN", {"default": False, "tooltip": "Diagnostic run: verify executed FF chunks and measure attention/FF memory peaks. Adds eager boundaries and synchronization; disable for speed comparisons."}),
+                "ff_chunk_tokens": ("INT", {"default": 4096, "min": 0, "max": 65536, "step": 1024, "tooltip": "Video feed-forward chunk size. 4096 reduces peak VRAM; 0 disables. Smaller chunks may increase weight-transfer overhead."}),
                 "negative": (
                     "CONDITIONING",
                     {"tooltip": "Optional Comfy CFG extension. Strict official parity does not require it."},
@@ -2531,6 +2590,7 @@ class LTXDFRRunStage2AVLoop:
                         )
                     },
                 ),
+                "temporal_tiles": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1, "tooltip": "1: original untiled Stage 2. 0: inherit temporal window count from modular handoff. 2 or more: split model predictions in time only, combining each step before the shared AV update. Full spatial resolution is retained."}),
             },
         }
 
@@ -2556,6 +2616,11 @@ class LTXDFRRunStage2AVLoop:
         cfg_scale=1.0,
         negative=None,
         sigmas=None,
+        ff_chunk_tokens=4096,
+        diagnose_memory=False,
+        output_chunk_tokens=4096,
+        compact_timesteps=True,
+        temporal_tiles=1,
     ):
         return (
             run_stage2_spatial_dfr(
@@ -2566,6 +2631,11 @@ class LTXDFRRunStage2AVLoop:
                 stage_2_video_state=stage_2_video_state,
                 sigmas=sigmas,
                 cfg_scale=float(cfg_scale),
+                ff_chunk_tokens=int(ff_chunk_tokens),
+                diagnose_memory=bool(diagnose_memory),
+                output_chunk_tokens=int(output_chunk_tokens),
+                compact_timesteps=bool(compact_timesteps),
+                temporal_tiles=temporal_tiles,
             ),
         )
 
@@ -2761,6 +2831,10 @@ class LTXSpatialDFRStage1PreviewDecode:
                         "tooltip": "Manual mode only. Spatial overlap is derived internally (currently 160).",
                     },
                 ),
+                "attention_chunks": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1,
+                    "tooltip": "Allowed: 1, 2, or 4. One is fastest in measured runs; 2/4 reduce attention workspace. Independent of auto/manual tiling."}),
+                "auto_tile_multiplier": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05,
+                    "tooltip": "Auto tiling only. Multiplies both computed tile caps. 1.0 preserves current behavior; below 1 uses smaller limits; above 1 allows larger tiles. Existing memory checks still apply."}),
             }
         }
 
@@ -2786,6 +2860,8 @@ class LTXSpatialDFRStage1PreviewDecode:
         tile_frames=104,
         tile_height=416,
         tile_width=544,
+        attention_chunks=1,
+        auto_tile_multiplier=1.0,
     ):
         images = decode_stage1_spatial_dfr_video(
             stage_1_handoff,
@@ -2797,6 +2873,8 @@ class LTXSpatialDFRStage1PreviewDecode:
             tile_frames=int(tile_frames),
             tile_height=int(tile_height),
             tile_width=int(tile_width),
+            attention_chunks=attention_chunks,
+            auto_tile_multiplier=auto_tile_multiplier,
         )
         return (images,)
 
@@ -2822,7 +2900,6 @@ class LTXDFRSpatialDFRVideoDecode:
                     "LATENT",
                     {"tooltip": "Video output from 'Finalize Stage 2 Output / Trim'."},
                 ),
-                "dfr_layout": ("LTX_DFR_LAYOUT",),
                 "vae": ("VAE",),
                 "vae_name": (
                     vae_choices,
@@ -2870,6 +2947,10 @@ class LTXDFRSpatialDFRVideoDecode:
                         "tooltip": "Manual mode only. Spatial overlap is derived internally (currently 160).",
                     },
                 ),
+                "attention_chunks": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1,
+                    "tooltip": "Allowed: 1, 2, or 4. One is fastest in measured runs; 2/4 reduce attention workspace. Independent of auto/manual tiling."}),
+                "auto_tile_multiplier": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05,
+                    "tooltip": "Auto tiling only. Multiplies both computed tile caps. 1.0 preserves current behavior; below 1 uses smaller limits; above 1 allows larger tiles. Existing memory checks still apply."}),
             }
         }
 
@@ -2887,14 +2968,16 @@ class LTXDFRSpatialDFRVideoDecode:
         self,
         stage_2_handoff,
         final_video_latent,
-        dfr_layout,
         vae,
         vae_name,
         use_auto_tiling=True,
         tile_frames=104,
         tile_height=416,
         tile_width=544,
+        attention_chunks=1,
+        auto_tile_multiplier=1.0,
     ):
+        dfr_layout = layout_from_handoff(stage_2_handoff)
         images = decode_spatial_dfr_video(
             stage_2_handoff,
             final_video_latent,
@@ -2905,8 +2988,36 @@ class LTXDFRSpatialDFRVideoDecode:
             tile_frames=int(tile_frames),
             tile_height=int(tile_height),
             tile_width=int(tile_width),
+            attention_chunks=attention_chunks,
+            auto_tile_multiplier=auto_tile_multiplier,
         )
         return (images,)
+
+
+class LTXDFRExperimentalBlockStreamingDecode:
+    @classmethod
+    def INPUT_TYPES(cls):
+        required=LTXDFRSpatialDFRVideoDecode.INPUT_TYPES()["required"]
+        required={k:v for k,v in required.items() if k in ("stage_2_handoff","final_video_latent","vae","vae_name")}
+        required.update({
+            "tile_frames": ("INT", {"default":104,"min":80,"max":10000,"step":8,"tooltip":"Temporal window size in frames. Uses the original checkpoint-derived overlap (currently 40 frames)."}),
+            "core_height": ("INT", {"default":320,"min":32,"max":2048,"step":8,"tooltip":"Owned output core in pixels; halos added internally. Smaller cores reduce GPU workspace."}),
+            "core_width": ("INT", {"default":512,"min":32,"max":2048,"step":8,"tooltip":"Owned output core in pixels. Start at 320x512 on a 12GB GPU."}),
+        })
+        temporal=required.pop("tile_frames")
+        required["tile_frames"]=temporal
+        required["use_auto_tiling"]=("BOOLEAN", {"default":False,"tooltip":"Automatically select temporal window and spatial cores using the classic autotiler, adjusted for streaming halos. Ignores manual core and frame settings."})
+        required["auto_tile_multiplier"]=("FLOAT", {"default":1.0,"min":0.1,"max":2.0,"step":0.05,"tooltip":"Auto mode only. Scales the classic autotiler token and spatial-area caps; lower permits smaller tiles, higher permits larger tiles."})
+        return {"required":required}
+    RETURN_TYPES=("IMAGE","STRING")
+    RETURN_NAMES=("images","report")
+    FUNCTION="decode"
+    CATEGORY="LTX/DFR Spatial/Experimental"
+    DESCRIPTION="Experimental CPU-backed eight-block DiffVAE decode. Connect the same Stage-2 handoff, final latent and VAE as Spatial DFR Video Decode. Layout is read from the handoff. Uses original temporal windows and global noise within each window; outputs can differ. Requires substantial system RAM (roughly 20GB+ for a 97-frame 2MP case). Run separately from the baseline."
+    def decode(self,stage_2_handoff,final_video_latent,vae,vae_name,core_height=320,core_width=512,tile_frames=104,use_auto_tiling=False,auto_tile_multiplier=1.0):
+        dfr_layout = layout_from_handoff(stage_2_handoff)
+        from .decoder_block_streaming_node import decode_experimental
+        return decode_experimental(stage_2_handoff,final_video_latent,dfr_layout,vae,vae_name,core_height=core_height,core_width=core_width,tile_frames=tile_frames,use_auto_tiling=use_auto_tiling,auto_tile_multiplier=auto_tile_multiplier)
 
 
 class LTXDFRPrepareOfficialFinalDecode:
@@ -2920,10 +3031,6 @@ class LTXDFRPrepareOfficialFinalDecode:
                     "LTX_DFR_STAGE2_RESULT_HANDOFF",
                     {"tooltip": "Single output from 'Run Stage 2 AV Loop'."},
                 ),
-                "dfr_layout": (
-                    "LTX_DFR_LAYOUT",
-                    {"tooltip": "Used to discard generated decoder keyframes beyond the requested frame count."},
-                ),
             }
         }
 
@@ -2936,7 +3043,8 @@ class LTXDFRPrepareOfficialFinalDecode:
         "decoder paths. The ordinary VAE Decode path does not need this node."
     )
 
-    def prepare(self, stage_2_handoff, dfr_layout):
+    def prepare(self, stage_2_handoff):
+        dfr_layout = layout_from_handoff(stage_2_handoff)
         return prepare_official_final_decode(stage_2_handoff, dfr_layout)
 
 
@@ -3111,20 +3219,11 @@ class LTXDFRFinalizeStage2Output:
                         )
                     },
                 ),
-                "dfr_layout": (
-                    "LTX_DFR_LAYOUT",
-                    {
-                        "tooltip": (
-                            "Exact DFR layout from 'LTX DFR: Resolve DFR Canvas'. Its requested vs padded frame counts "
-                            "define how much of the Stage-2 base latent tail must be trimmed away before decoding."
-                        )
-                    },
-                ),
             }
         }
 
-    RETURN_TYPES = ("LATENT", "LATENT")
-    RETURN_NAMES = ("final_video_latent", "final_audio_latent")
+    RETURN_TYPES = ("LATENT", "LATENT", "FLOAT")
+    RETURN_NAMES = ("final_video_latent", "final_audio_latent", "fps")
     FUNCTION = "finalize"
     CATEGORY = "LTX/DFR Spatial/Stage 2 - Final Output"
     DESCRIPTION = (
@@ -3133,8 +3232,9 @@ class LTXDFRFinalizeStage2Output:
         "after LTXV Audio VAE Decode, run 'LTX DFR: Trim Stage 2 Decoded Audio' to match upstream exactly."
     )
 
-    def finalize(self, stage_2_handoff, dfr_layout):
-        return finalize_stage2_result(stage_2_handoff, dfr_layout)
+    def finalize(self, stage_2_handoff):
+        dfr_layout = layout_from_handoff(stage_2_handoff)
+        return (*finalize_stage2_result(stage_2_handoff, dfr_layout), float(stage_2_handoff.fps))
 
 
 class LTXDFRSplitStage1AudioVideo:
@@ -3291,15 +3391,6 @@ class LTXDFRTrimStage2DecodedAudio:
                         )
                     },
                 ),
-                "dfr_layout": (
-                    "LTX_DFR_LAYOUT",
-                    {
-                        "tooltip": (
-                            "The original DFR layout. requested_frames together with the handoff fps determines the exact "
-                            "final video duration used to crop the decoded Stage-1 waveform."
-                        )
-                    },
-                ),
             }
         }
 
@@ -3313,7 +3404,8 @@ class LTXDFRTrimStage2DecodedAudio:
         "post-decode trim so the muxed audio cannot outlast the trimmed final video."
     )
 
-    def trim(self, stage_2_handoff, decoded_audio, dfr_layout):
+    def trim(self, stage_2_handoff, decoded_audio):
+        dfr_layout = layout_from_handoff(stage_2_handoff)
         return (trim_stage2_result_decoded_audio(stage_2_handoff, decoded_audio, dfr_layout),)
 
 
@@ -3702,13 +3794,13 @@ class LTXDFRVideoGeneratedKeyframeSlots:
                 f"{layout['padded_frames']}, but target latent represents {target_pixel_frames} pixel frames. "
                 "Connect Resolve DFR Canvas's padded_video_length to EmptyLTXVLatentVideo.length."
             )
-        return (
-            apply_video_generated_keyframe_slots(
-                target_latent=official_state_latent,
-                pixel_frame_indices=list(layout["pixel_frame_indices"]),
-                fps=fps,
-            ),
+        out = apply_video_generated_keyframe_slots(
+            target_latent=official_state_latent,
+            pixel_frame_indices=list(layout["pixel_frame_indices"]),
+            fps=fps,
         )
+        out["dfr_layout"] = dict(layout)
+        return (out,)
 
 
 class LTXDFRVideoConditionByReferenceLatent:
@@ -5667,6 +5759,7 @@ class LTXDFRValidateExactFullDecodeC26B:
 
 # Only the completed/user-facing nodes are registered with ComfyUI.
 NODE_CLASS_MAPPINGS = {
+    'LTXDFRExperimentalBlockStreamingDecode_DFRSpatial': LTXDFRExperimentalBlockStreamingDecode,
     'LTXDFRResolveDFRCanvas_DFRSpatial': LTXDFRResolveDFRCanvas,
     'LTXDFRConditioningResizeCenterCrop_DFRSpatial': LTXDFRConditioningResizeCenterCrop,
     'LTXDFRValidateDFRModelCapability_DFRSpatial': LTXDFRValidateDFRModelCapability,
@@ -5680,6 +5773,8 @@ NODE_CLASS_MAPPINGS = {
     'LTXSpatialDFRStage1PreviewDecode_DFRSpatial': LTXSpatialDFRStage1PreviewDecode,
     'LTXDFRTrimStage1DecodedAudio_DFRSpatial': LTXDFRTrimStage1DecodedAudio,
     'LTXDFRRunStage2SpatialUpscale_DFRSpatial': LTXDFRRunStage2SpatialUpscale,
+    'LTXDFRRunModularStage2SpatialUpscale_DFRSpatial': LTXDFRRunModularStage2SpatialUpscale,
+    'LTXDFRRunStage2SpatialUpscaleFromStage2HandoffTest_DFRSpatial': LTXDFRRunStage2SpatialUpscaleFromStage2HandoffTest,
     'LTXDFRPrepareStage2DetailingModel_DFRSpatial': LTXDFRPrepareStage2DetailingModel,
     'LTXDFRFinalizeStage2DFRConditioning_DFRSpatial': LTXDFRFinalizeStage2DFRConditioning,
     'LTXDFRRunStage2AVLoop_DFRSpatial': LTXDFRRunStage2AVLoop,
@@ -5774,6 +5869,7 @@ DEV_NODE_CLASS_MAPPINGS = {
     'LTXDFRProbeFinalDecoderRuntimeU33A_DFRSpatial': LTXDFRProbeFinalDecoderRuntimeU33A,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "LTXDFRExperimentalBlockStreamingDecode_DFRSpatial": "LTX DFR: Experimental Block Streaming Video Decode",
     "LTXSpatialDFRStage1PreviewDecode_DFRSpatial": "LTX Spatial DFR: Stage 1 Preview Decode",
     "LTXDFRSpatialDFRVideoDecode_DFRSpatial": "LTX DFR: Spatial DFR Video Decode",
     "LTXDFRPrepareAutoFullDecodeScheduleC26B_DFRSpatial": "LTX DFR: Prepare Auto Full Decode Schedule (C26b)",
@@ -5834,6 +5930,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LTXDFRPrepareStage2Handoff_DFRSpatial": "LTX DFR: Prepare Stage 2 Handoff",
     "LTXDFRValidateStage2Handoff_DFRSpatial": "LTX DFR TEST: Validate Stage 2 Handoff",
     "LTXDFRRunStage2SpatialUpscale_DFRSpatial": "LTX DFR: Run Stage 2 Spatial Upscale",
+    "LTXDFRRunModularStage2SpatialUpscale_DFRSpatial": "LTX DFR: Run Modular Stage 2 Spatial Upscaler",
+    "LTXDFRRunStage2SpatialUpscaleFromStage2HandoffTest_DFRSpatial": "LTX DFR: Run Stage 2 Spatial Upscaler From Stage 2 Handoff (TEST ONLY)",
     "LTXDFRValidateStage2SpatialUpscale_DFRSpatial": "LTX DFR TEST: Validate Stage 2 Spatial Upscale",
     "LTXDFRResolveStage2DetailingMetadata_DFRSpatial": "LTX DFR TEST: Resolve Stage 2 Detailing Metadata (Atomic)",
     "LTXDFRPrepareStage2DetailingModel_DFRSpatial": "LTX DFR: Prepare Stage 2 Detailing Model",
@@ -5881,6 +5979,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # present the completed workflow surface separately from the atomic development
 # nodes that were useful while building and validating parity.
 _PUBLIC_NODE_CATEGORIES = {
+    "LTXDFRExperimentalBlockStreamingDecode_DFRSpatial": "LTX/DFR Spatial/Experimental",
     # Setup and user conditioning.
     "LTXDFRResolveDFRCanvas_DFRSpatial": "LTX/DFR Spatial/01 - Setup & Conditioning",
     "LTXDFRConditioningResizeCenterCrop_DFRSpatial": "LTX/DFR Spatial/01 - Setup & Conditioning",
@@ -5897,6 +5996,8 @@ _PUBLIC_NODE_CATEGORIES = {
     "LTXDFRTrimStage1DecodedAudio_DFRSpatial": "LTX/DFR Spatial/02 - Stage 1",
     # Complete Stage-2 operations.
     "LTXDFRRunStage2SpatialUpscale_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
+    "LTXDFRRunModularStage2SpatialUpscale_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
+    "LTXDFRRunStage2SpatialUpscaleFromStage2HandoffTest_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
     "LTXDFRPrepareStage2DetailingModel_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
     "LTXDFRFinalizeStage2DFRConditioning_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
     "LTXDFRRunStage2AVLoop_DFRSpatial": "LTX/DFR Spatial/03 - Stage 2",
@@ -5937,3 +6038,15 @@ def _apply_node_menu_categories():
 
 
 _apply_node_menu_categories()
+
+# Explicit non-parity workflow surface; keep it outside the atomic dev nodes.
+from .same_resolution_refinement import LTXExtractStage1VideoLatent, LTXRunSameResolutionRefinement
+
+NODE_CLASS_MAPPINGS.update({
+    "LTXExtractStage1VideoLatent_DFRSpatial": LTXExtractStage1VideoLatent,
+    "LTXRunSameResolutionRefinement_DFRSpatial": LTXRunSameResolutionRefinement,
+})
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "LTXExtractStage1VideoLatent_DFRSpatial": "LTX DFR: Extract Stage 1 Video Latent",
+    "LTXRunSameResolutionRefinement_DFRSpatial": "LTX DFR: Run Same-Resolution Refinement (Experimental)",
+})

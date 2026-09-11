@@ -22,6 +22,10 @@ from typing import Any
 import torch
 
 from .temporal_handoff import DFRTemporalHandoff, require_temporal_handoff
+if "." in (__package__ or ""):
+    from ..DFR_Spatial.frame_rate import official_conditioning_fps
+else:  # Standalone regression tests.
+    from DFR_Spatial.frame_rate import official_conditioning_fps
 
 
 TEMPORAL_UPSCALED_HANDOFF_VERSION = 1
@@ -48,10 +52,7 @@ class DFRTemporalUpscaledHandoff:
 
 def official_temporal_conditioning_fps(playback_fps: float) -> float:
     """Match the official high-frame-rate conditioning policy."""
-    playback_fps = float(playback_fps)
-    if playback_fps <= 0.0:
-        raise ValueError(f"playback_fps must be positive, got {playback_fps}.")
-    return 60.0 if playback_fps > 30.0 else playback_fps
+    return official_conditioning_fps(playback_fps)
 
 
 def _resolve_native_ltxv_latent_upsampler_node_class():

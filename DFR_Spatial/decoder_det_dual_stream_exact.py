@@ -33,10 +33,13 @@ state produced here and execute the real tile path.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+
+from .decoder_geometry_cache import cached_geometry
 
 from .decoder_det_stage_context import DFRDeterministicDecoderKeyframeContext
 from .decoder_det_stage_official_preflight import (
@@ -180,6 +183,16 @@ def _require_comfy_runtime():
     return model_management, comfy_na, comfy_kitchen
 
 
+@cached_geometry
+def _rope_axis_part(comfy_na, dim, base, device, length, positions=None):
+    inv = comfy_na.rope_inv_freqs(dim, base, device=device)
+    pos = (torch.arange(length, dtype=torch.float32, device=device) if positions is None
+           else positions.to(device=device, dtype=torch.float32))
+    ang = pos[:, None] * inv[None, :]
+    c, sine = ang.cos(), ang.sin()
+    return torch.stack([c, -sine, sine, c], dim=-1).reshape(c.shape[0], 1, 1, c.shape[1], 2, 2)
+
+
 def _rope_matrices_for_times(
     comfy_na: Any,
     attn: Any,
@@ -198,33 +211,17 @@ def _rope_matrices_for_times(
     replaced by the official fractional ``keyframe_clip_times`` values.
     """
     rope_split = tuple(int(v) for v in attn.rope_split)
-    inv_freqs = tuple(
-        comfy_na.rope_inv_freqs(dim, float(attn.rope_base), device=device)
-        for dim in rope_split
-    )
     t_pos = temporal_positions.to(device=device, dtype=torch.float32)
-    h_pos = (
-        torch.arange(height, dtype=torch.float32, device=device)
-        if height_positions is None
-        else height_positions.to(device=device, dtype=torch.float32)
-    )
-    w_pos = (
-        torch.arange(width, dtype=torch.float32, device=device)
-        if width_positions is None
-        else width_positions.to(device=device, dtype=torch.float32)
-    )
-    if int(h_pos.numel()) != int(height) or int(w_pos.numel()) != int(width):
-        raise ValueError(
-            "RoPE position lengths must match the tensor geometry: "
-            f"H={height}/{int(h_pos.numel())}, W={width}/{int(w_pos.numel())}."
+    if ((height_positions is not None and height_positions.numel() != height)
+            or (width_positions is not None and width_positions.numel() != width)):
+        raise ValueError("RoPE position lengths must match the tensor geometry.")
+    parts = [
+        _rope_axis_part(comfy_na, dim, float(attn.rope_base), device, length, positions)
+        for dim, length, positions in zip(
+            rope_split, (t_pos.numel(), height, width),
+            (t_pos, height_positions, width_positions), strict=True,
         )
-
-    axis_positions = (t_pos, h_pos, w_pos)
-    parts: list[torch.Tensor] = []
-    for pos, inv in zip(axis_positions, inv_freqs, strict=True):
-        ang = pos[:, None] * inv[None, :]
-        c, s = ang.cos(), ang.sin()
-        parts.append(torch.stack([c, -s, s, c], dim=-1).reshape(c.shape[0], 1, 1, c.shape[1], 2, 2))
+    ]
 
     t = int(t_pos.numel())
     freq = torch.cat(
@@ -329,40 +326,44 @@ def _forward_attention_with_keyframes_exact(
     num_slots: int,
     width_positions: torch.Tensor | None = None,
     separate_qkv: bool = False,
+    timings: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    video_times = torch.arange(
-        video_normed.shape[1], device=video_normed.device, dtype=torch.float32
-    )
-    q, k, v = _det_qkv_rope_comfy_backbone(
-        comfy_na,
-        comfy_kitchen,
-        attn,
-        video_normed,
-        video_times,
-        width_positions=width_positions,
-        separate_qkv=separate_qkv,
-    )
-    kq, kk, kv = _det_qkv_rope_comfy_backbone(
-        comfy_na,
-        comfy_kitchen,
-        attn,
-        keyframe_normed,
-        keyframe_times.to(device=keyframe_normed.device, dtype=torch.float32),
-        width_positions=width_positions,
-        separate_qkv=separate_qkv,
-    )
-    video_attn, keyframe_attn = joint_na3d(
-        q,
-        k,
-        v,
-        kq,
-        kk,
-        kv,
-        keyframe_times.to(device=q.device, dtype=torch.float32),
-        keyframe_valid.to(device=q.device, dtype=torch.bool),
-        tuple(int(v) for v in attn.kernel_size),
-        num_slots=int(num_slots),
-    )
+    phase = timings.phase if timings is not None else lambda name: nullcontext()
+    with phase("stage5.attention.qkv_rope"):
+        video_times = torch.arange(
+            video_normed.shape[1], device=video_normed.device, dtype=torch.float32
+        )
+        q, k, v = _det_qkv_rope_comfy_backbone(
+            comfy_na,
+            comfy_kitchen,
+            attn,
+            video_normed,
+            video_times,
+            width_positions=width_positions,
+            separate_qkv=separate_qkv,
+        )
+        kq, kk, kv = _det_qkv_rope_comfy_backbone(
+            comfy_na,
+            comfy_kitchen,
+            attn,
+            keyframe_normed,
+            keyframe_times.to(device=keyframe_normed.device, dtype=torch.float32),
+            width_positions=width_positions,
+            separate_qkv=separate_qkv,
+        )
+    with phase("stage5.attention.joint_attention"):
+        video_attn, keyframe_attn = joint_na3d(
+            q,
+            k,
+            v,
+            kq,
+            kk,
+            kv,
+            keyframe_times.to(device=q.device, dtype=torch.float32),
+            keyframe_valid.to(device=q.device, dtype=torch.bool),
+            tuple(int(v) for v in attn.kernel_size),
+            num_slots=int(num_slots),
+        )
     dim = int(attn.dim)
     video_attn = video_attn.reshape(*video_normed.shape[:-1], dim)
     keyframe_attn = keyframe_attn.reshape(*keyframe_normed.shape[:-1], dim)
@@ -378,7 +379,8 @@ def _forward_attention_with_keyframes_exact(
             out[:, t0:t1] = attn.proj(x[:, t0:t1])
         return out
 
-    return project_chunked(video_attn), project_chunked(keyframe_attn)
+    with phase("stage5.attention.projection"):
+        return project_chunked(video_attn), project_chunked(keyframe_attn)
 
 
 def _forward_block_with_keyframes_exact(

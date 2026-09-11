@@ -21,7 +21,7 @@ from typing import Any
 
 import torch
 
-from .stage2_handoff import DFRStage2Handoff
+from .stage2_handoff import DFRStage2Handoff, HANDOFF_VERSION
 
 
 SPATIAL_UPSCALE_FACTOR = 2
@@ -250,6 +250,72 @@ def prepare_stage2_spatial_upscale(
         stage_1_audio_for_stage2,
         upscaled_generated_keyframes,
         report,
+    )
+
+
+def prepare_stage2_spatial_upscale_from_stage2_result_for_test(
+    stage_2_handoff: Any,
+    upscale_model: Any,
+    vae: Any,
+) -> tuple[DFRUpscaledStage1Handoff, dict[str, Any]]:
+    """TEST ONLY: adapt a completed Stage-2 result into the legacy Stage-1-shaped boundary.
+
+    This deliberately reuses the existing Stage-2 spatial pipeline without introducing
+    a new generalized handoff type.  The field names in the synthetic
+    :class:`DFRStage2Handoff` are therefore semantically historical: the video and
+    generated-keyframe tensors come from completed Stage 2, and the RNG continuation
+    is ``rng_state_after_stage2_av``.  Audio intentionally remains the preserved
+    Stage-1 audio, matching the existing Spatial/Temporal DFR convention.
+
+    The original Stage-1 noiser token-shape fields are left empty on purpose.  They
+    are only required by independent Stage-1 RNG replay validators, whose assumptions
+    do not apply to this experimental continuation boundary.
+    """
+    # Local import avoids the intentional stage2_result -> stage2_spatial dependency
+    # becoming a module-level circular import.
+    from .stage2_result import require_stage2_result_handoff
+
+    completed = require_stage2_result_handoff(stage_2_handoff)
+    decoder = completed.decoder_handoff
+
+    video = completed.padded_video_latent
+    keyframes = decoder.stage_2_generated_keyframes
+    audio = completed.stage_1_audio_latent
+    rng_state = decoder.rng_state_after_stage2_av
+
+    if not torch.is_tensor(video) or video.ndim != 5:
+        raise ValueError("Completed Stage-2 video must be [B,C,T,H,W].")
+    if not torch.is_tensor(keyframes) or keyframes.ndim != 5:
+        raise ValueError("Completed Stage-2 generated keyframes must be [B,C,K,H,W].")
+    if not torch.is_tensor(audio) or audio.ndim != 4:
+        raise ValueError("Preserved Stage-1 audio must be [B,C,T,F].")
+    if not torch.is_tensor(rng_state):
+        raise ValueError("Completed Stage-2 handoff has no RNG continuation state.")
+
+    # Mirror the normal Stage-1 handoff rule: only the first video batch continues
+    # through DFR.  Tensors are not cloned here; the synthetic handoff is only a
+    # wiring adapter and the native x2 upscaler produces the new allocations.
+    synthetic = DFRStage2Handoff(
+        version=HANDOFF_VERSION,
+        seed=int(decoder.seed),
+        rng_state_after_stage1_av=rng_state.detach().cpu().clone(),
+        rng_device_type=str(decoder.rng_device_type),
+        reserved_half_res_video=video[:1],
+        stage_1_generated_keyframes=keyframes,
+        stage_1_audio_latent=audio,
+        video_token_shape_at_stage1_noise=(),
+        audio_token_shape_at_stage1_noise=(),
+        fps=float(completed.fps),
+        duration_seconds=float(completed.duration_seconds),
+        dfr_layout=getattr(completed, "dfr_layout", None),
+        temporal_seams=tuple(getattr(completed, "temporal_seams", ())),
+        temporal_tiles=int(getattr(completed, "temporal_tiles", 1)),
+    )
+
+    return prepare_stage2_spatial_upscale_from_handoff(
+        synthetic,
+        upscale_model,
+        vae,
     )
 
 

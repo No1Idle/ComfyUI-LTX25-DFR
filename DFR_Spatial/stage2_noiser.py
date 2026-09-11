@@ -98,6 +98,8 @@ def _require_exact_stage2_sigmas(
 def _prepare_stage2_video(
     stage_2_video_state: dict[str, Any],
     device: torch.device,
+    *,
+    require_reference: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], torch.Tensor, torch.Tensor, torch.Tensor]:
     state = clone_or_create_official_state(stage_2_video_state)
     tokens = ensure_token_state(
@@ -113,11 +115,13 @@ def _prepare_stage2_video(
         )
 
     operations = list(state.get("operations", []))
-    if not operations or operations[-1].get("type") != "VideoConditionByReferenceLatent":
+    expected_last = "VideoConditionByReferenceLatent" if require_reference else "VideoGeneratedKeyframeSlots"
+    if not operations or operations[-1].get("type") != expected_last:
         raise ValueError(
-            "Stage 2E requires the validated detail-enabled Stage-2C state ending in "
-            "VideoConditionByReferenceLatent."
+            f"Stage 2 noising requires conditioning ending in {expected_last}."
         )
+    if not require_reference and any(op.get("type") == "VideoConditionByReferenceLatent" for op in operations):
+        raise ValueError("Same-resolution refinement must not contain reference-video conditioning.")
 
     latent = tokens["latent"].to(device=device, dtype=OFFICIAL_DFR_STATE_DTYPE)
     clean = tokens["clean_latent"].to(device=device, dtype=OFFICIAL_DFR_STATE_DTYPE)
@@ -212,6 +216,7 @@ def materialize_stage2_av_gaussian_noised_states(
     allow_experimental_extra_step: bool = False,
     require_official_sigmas: bool = True,
     collect_diagnostics: bool = True,
+    require_reference: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any], str]:
     """Continue the Stage-1 RNG stream and noise Stage-2 VIDEO then AUDIO."""
     if not isinstance(stage_2_handoff, DFRStage2Handoff):
@@ -229,13 +234,26 @@ def materialize_stage2_av_gaussian_noised_states(
     fallback = stage_2_video_state["samples"].device
     target_device = torch.device(device) if device is not None else _preferred_comfy_device(fallback)
 
-    v_state, v_tokens, v_latent, v_clean, v_mask = _prepare_stage2_video(stage_2_video_state, target_device)
+    v_state, v_tokens, v_latent, v_clean, v_mask = _prepare_stage2_video(
+        stage_2_video_state, target_device, require_reference=require_reference
+    )
     a_state, a_tokens, a_latent, a_clean, a_mask = _build_stage2_audio_state(
         stage_2_handoff,
         stage_1_audio_for_stage2,
         target_device,
         verify_handoff_audio=collect_diagnostics,
     )
+
+    if getattr(stage_2_handoff, "temporal_seams", ()):
+        # Temporal resampling preserves the original audio. N -> 2N-1 at
+        # doubled FPS changes N/fps by half a source frame, not the audio.
+        # Record both timelines explicitly; never resize/reseed the audio.
+        video_frames = (int(stage_2_video_state["samples"].shape[2])-1) * int(v_state.get("scale_factors", (8,32,32))[0]) + 1
+        a_state["video_alignment"].update(
+            mode="preserved_stage1_audio", pixel_frames=video_frames,
+            fps=float(v_state.get("fps") or stage_2_handoff.fps),
+            source_duration_seconds=float(stage_2_handoff.duration_seconds),
+        )
 
     # Exact upstream continuation: the same generator object used in Stage 1 is
     # now consumed by Stage-2 video first and Stage-2 audio second.

@@ -34,7 +34,8 @@ from .audio_state import (
     _unpatchify_audio,
 )
 from .av_model_bridge import DFRStage1AVModelInput, materialize_stage1_av_model_input
-from .dfr_model_bridge import DFRComfyModelInput, materialize_comfy_model_input
+from .dfr_model_bridge import DFRComfyModelInput, materialize_comfy_model_input, materialize_video_tokens_with_layout
+from .memory_profile import SamplerMemoryProfile
 from .dfr_noiser import NOISER_METADATA_KEY
 from .dfr_sigmas import validate_custom_sigma_schedule
 from .dfr_execution import (
@@ -1010,6 +1011,7 @@ def _execute_stage1_av_whole_schedule_comfy(
     seed: int,
     collect_diagnostics: bool,
     profiler: Stage1RuntimeProfiler | None,
+    memory_profile: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str], str]:
     """Run all Stage-1 AV transitions inside one Comfy sampling lifecycle."""
     import time
@@ -1055,10 +1057,23 @@ def _execute_stage1_av_whole_schedule_comfy(
         audio_mask = av_model_input.audio_denoise_mask
         video_clean = video_tokens["clean_latent"]
         audio_clean = audio_tokens["clean_latent"]
+        # The native backend does not consume the direct bridge's position copies.
+        del av_model_input
+        initial_packed_shape = tuple(initial_packed.shape)
+        # Only shape/operation metadata is needed after initial packing. Release
+        # the initial dense video payload while retaining its geometry contract.
+        reference_video_input.x = torch.empty(reference_video_input.x.shape, device="meta")
+        reference_video_input.denoise_mask = torch.empty(reference_video_input.denoise_mask.shape, device="meta")
+        _set_working_stage1_av_latents(
+            working_video, working_audio, video_tokens, audio_tokens, current_video, current_audio,
+        )
     loaded_models = None
     processed_conds = None
     real_model = None
     step_reports: list[str] = []
+
+    memory = SamplerMemoryProfile(memory_profile, getattr(model, "load_device", initial_packed.device), model)
+    memory.snapshot("before model load")
 
     try:
         with profile_section(profiler, "model + conditioning preparation"):
@@ -1083,11 +1098,16 @@ def _execute_stage1_av_whole_schedule_comfy(
             )
 
             runtime_model_options = model_patcher_mod.create_model_options_clone(model.model_options)
+            from .stage2_temporal_tiling import install_temporal_model_wrapper
+            install_temporal_model_wrapper(runtime_model_options, reference_video_input, comfy_utils, noised_video_state)
             runtime_model_options.setdefault("transformer_options", {})["sample_sigmas"] = sigma_schedule.to(
                 device=load_device
             )
             real_model.latent_shapes = latent_shapes
             model.pre_run()
+
+        del initial_packed, packed_mask
+        memory.snapshot("after model load")
 
         try:
             progress = comfy_utils.ProgressBar(int(sigma_schedule.numel() - 1))
@@ -1095,6 +1115,7 @@ def _execute_stage1_av_whole_schedule_comfy(
             progress = None
 
         for step_index in range(int(sigma_schedule.numel() - 1)):
+            memory.start_step()
             step_started = time.perf_counter() if collect_diagnostics else None
             with profile_section(profiler, "AV materialization + packing"):
                 _set_working_stage1_av_latents(
@@ -1105,11 +1126,10 @@ def _execute_stage1_av_whole_schedule_comfy(
                     current_video,
                     current_audio,
                 )
-                video_model_input, packed_latent, _current_mask, current_shapes = _materialize_native_comfy_av_inputs(
-                    working_video,
-                    working_audio,
-                )
-                _assert_static_model_input_compatible(reference_video_input, video_model_input)
+                video_payload = materialize_video_tokens_with_layout(current_video, reference_video_input)
+                packed_latent, current_shapes = comfy_utils.pack_latents([video_payload, working_audio["samples"]])
+                current_shapes = [tuple(int(v) for v in shape) for shape in current_shapes]
+                del video_payload
                 if current_shapes != latent_shapes:
                     raise RuntimeError(
                         f"Packed AV latent shapes changed during Stage 1: {latent_shapes} -> {current_shapes}."
@@ -1145,7 +1165,7 @@ def _execute_stage1_av_whole_schedule_comfy(
                         f"Expected unpacked multimodal output to contain [video, audio], got {len(unpacked)} modalities."
                     )
                 video_output, audio_output = unpacked[0], unpacked[1]
-                raw_video = _extract_official_tokens_from_materialized_output(video_output, video_model_input)
+                raw_video = _extract_official_tokens_from_materialized_output(video_output, reference_video_input)
                 raw_audio = audio_output.permute(0, 2, 1, 3).reshape(
                     audio_output.shape[0], audio_output.shape[2], -1
                 ).contiguous()
@@ -1165,6 +1185,13 @@ def _execute_stage1_av_whole_schedule_comfy(
                     sigma=sigma_value,
                     sigma_next=sigma_next,
                 )
+                # Refresh the working references immediately so the preceding
+                # trajectory tensors cannot survive into the next forward call.
+                _set_working_stage1_av_latents(
+                    working_video, working_audio, video_tokens, audio_tokens, current_video, current_audio,
+                )
+                del packed_latent, packed_denoised, unpacked, video_output, audio_output, raw_video, raw_audio
+            memory.end_step(step_index)
             if collect_diagnostics:
                 assert step_started is not None
                 step_reports.append(
@@ -1196,7 +1223,7 @@ def _execute_stage1_av_whole_schedule_comfy(
         details = (
             f"execution_mode=whole_schedule_comfy_native_bridge; prepare_sampling_calls=1; "
             f"process_conds_calls=1; pre_run_calls=1; cleanup_calls=1; "
-            f"packed_shape={tuple(int(x) for x in initial_packed.shape)}; latent_shapes={latent_shapes}"
+            f"packed_shape={initial_packed_shape}; latent_shapes={latent_shapes}"
         )
     return final_video, final_audio, step_reports, details
 

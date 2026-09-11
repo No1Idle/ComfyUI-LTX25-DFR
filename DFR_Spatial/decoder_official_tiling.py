@@ -32,6 +32,14 @@ _MIN_MODEL_BYTES_FLOOR = 1 << 30
 _CHUNKED_EAGER_KEYFRAME_STAGE5_MEM_COEF = 5.0
 _CHUNKED_EAGER_KEYFRAME_RESERVE_BYTES = 1 << 30
 
+# Comfy CPU-Stage4 runtime-ranking terms.  Exact scheduled T/H/W work is the
+# dominant term; these are deliberately small secondary penalties so the
+# planner can break near-ties in favor of fewer launches/groups and less
+# extreme spatial shapes without overriding a materially lower-work candidate.
+_COMFY_RUNTIME_TILE_PENALTY = 0.0005
+_COMFY_RUNTIME_EXTRA_TEMPORAL_GROUP_PENALTY = 0.005
+_COMFY_RUNTIME_ASPECT_PENALTY = 0.01
+
 # Peak of the official SDR encode sink, expressed with doubled half-channel
 # counts so the arithmetic remains integral.
 _CONVERT_PEAK_UV_CHANNELS_X2 = 5
@@ -486,6 +494,71 @@ def _volumetric_overlap_waste(
     return processed / unique
 
 
+def _runtime_axis_stats(
+    *,
+    length: int,
+    tile_size: int,
+    overlap: int,
+    min_tile_size: int,
+) -> tuple[int, int]:
+    """Return scheduled (tile_count, processed_length) for one pixel axis."""
+    intervals = split_by_size(
+        int(tile_size),
+        int(overlap),
+        min_tile_size=int(min_tile_size),
+    )(int(length)).intervals
+    return (
+        len(intervals),
+        sum(int(iv.end) - int(iv.start) for iv in intervals),
+    )
+
+
+def _comfy_runtime_candidate_score(
+    *,
+    num_frames: int,
+    height: int,
+    width: int,
+    tile_frames: int,
+    tile_height: int,
+    tile_width: int,
+    overlap_t: int,
+    overlap_hw: int,
+    min_t_px: int,
+    min_h_px: int,
+    min_w_px: int,
+) -> tuple[float, float, int, int, int, int, float]:
+    """Estimate relative Stage-5 runtime for one already-safe candidate.
+
+    The primary signal is exact scheduled pixel-frame work (including real edge
+    tile sizes and overlap).  Small secondary penalties represent repeated tile
+    launches, extra temporal groups, and very elongated spatial shapes.  The
+    coefficients intentionally remain weak: safety is handled before this score,
+    and materially lower exact work should still win.
+    """
+    n_t, processed_t = _runtime_axis_stats(
+        length=num_frames, tile_size=tile_frames, overlap=overlap_t, min_tile_size=min_t_px
+    )
+    n_h, processed_h = _runtime_axis_stats(
+        length=height, tile_size=tile_height, overlap=overlap_hw, min_tile_size=min_h_px
+    )
+    n_w, processed_w = _runtime_axis_stats(
+        length=width, tile_size=tile_width, overlap=overlap_hw, min_tile_size=min_w_px
+    )
+    total_tiles = int(n_t) * int(n_h) * int(n_w)
+    unique_work = max(1, int(num_frames) * int(height) * int(width))
+    exact_work = int(processed_t) * int(processed_h) * int(processed_w)
+    exact_work_ratio = float(exact_work) / float(unique_work)
+
+    short_side = max(1, min(int(tile_height), int(tile_width)))
+    long_side = max(int(tile_height), int(tile_width))
+    aspect_log = math.log(float(long_side) / float(short_side))
+    score = exact_work_ratio
+    score += _COMFY_RUNTIME_TILE_PENALTY * float(total_tiles)
+    score += _COMFY_RUNTIME_EXTRA_TEMPORAL_GROUP_PENALTY * float(max(0, n_t - 1))
+    score += _COMFY_RUNTIME_ASPECT_PENALTY * float(aspect_log * aspect_log)
+    return score, exact_work_ratio, total_tiles, n_t, n_h, n_w, aspect_log
+
+
 def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
     *,
     tile_halos: tuple[tuple[int, int, int], tuple[int, int, int]],
@@ -503,6 +576,11 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
     element_size: int = _DEFAULT_ELEMENT_SIZE,
     natten_trailing_pad_latent_frames: int = 0,
     out_channels: int = _ACCUMULATOR_CHANNELS,
+    stage4_on_cpu: bool = False,
+    max_stage5_tokens: int | None = None,
+    max_stage5_spatial_pixels: int | None = None,
+    runtime_aware_scoring: bool = False,
+    selection_diagnostics: dict[str, float | int | str] | None = None,
 ) -> TileSizeConfig:
     """Official auto-tiler specialized to this port's validated decode mode.
 
@@ -510,7 +588,17 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
     executor is deliberately fixed to keyframe-aware CHUNKED_EAGER with fused
     Triton joint attention, so its official coefficient is 5 and its reserve is
     1 GiB.  Candidate enumeration, peak estimate and tie-breaking are otherwise
-    the frozen ``recommended_decode_tiling_config`` implementation.
+    the frozen ``recommended_decode_tiling_config`` implementation. With
+    ``stage4_on_cpu``, charge one uploaded tile instead of the full feature volume
+    and use the current Comfy executor's single group accumulator geometry.
+    ``max_stage5_tokens`` is an optional Comfy-side empirical peak guardrail.
+    ``max_stage5_spatial_pixels`` independently caps the pixel HxW footprint of
+    one tile so shorter temporal candidates cannot spend all saved memory on a
+    spatial shape that crosses the Stage-5 context/workspace performance cliff.
+    ``runtime_aware_scoring`` is a Comfy-only ranking mode applied *after* all
+    memory/guardrail checks: it scores the exact intervals that will actually be
+    executed instead of ``tile_count * nominal_tile_size``.  The frozen/default
+    official path leaves both guardrails unset and keeps the original ranking.
     """
     if height < 1 or width < 1 or num_frames < 1:
         raise ValueError(f"height/width/num_frames must be >= 1, got {height}x{width}x{num_frames}")
@@ -553,7 +641,8 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
     )
     usable = max(
         0,
-        int(free_bytes) - model_cost - _CHUNKED_EAGER_KEYFRAME_RESERVE_BYTES - s4_feat_bytes,
+        int(free_bytes) - model_cost - _CHUNKED_EAGER_KEYFRAME_RESERVE_BYTES
+        - (0 if stage4_on_cpu else s4_feat_bytes),
     )
     s5_bytes_per_token = max(
         1.0,
@@ -564,9 +653,17 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
     t_cands = _axis_candidates(num_frames, overlap_t, min_t_px, step_t)
     h_cands = _axis_candidates(height, overlap_hw, min_h_px, step_h)
     w_cands = _axis_candidates(width, overlap_hw, min_w_px, step_w)
-    scored: list[tuple[float, int, int, int, int, int]] = []
+    scored: list[tuple] = []
     for tile_t, n_t in t_cands:
-        acc_frames = 2 * int(tile_t)
+        # The frozen LTX planner assumes two tile-sized full-resolution
+        # accumulator surfaces.  The current Comfy CPU-Stage4 executor owns one
+        # temporal-group buffer, whose maximum length is min(tile_t, num_frames).
+        # Keep the original charge for the untouched official/GPU-Stage4 path.
+        acc_frames = (
+            min(int(tile_t), int(num_frames))
+            if stage4_on_cpu
+            else 2 * int(tile_t)
+        )
         acc_bytes = acc_frames * int(height) * int(width) * acc_bytes_per_pixel
         downstream_bytes = _emit_convert_bytes(
             tile_frames=_max_emitted_frames(
@@ -584,28 +681,86 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
         max_s5_tokens = int((usable - acc_bytes - downstream_bytes) // s5_bytes_per_token)
         for tile_h, n_h in h_cands:
             for tile_w, n_w in w_cands:
+                # CPU storage replaces full-volume GPU residency with one uploaded tile.
+                # Include the causal boundary frame and all trailing ghost frames.
+                upload_bytes = 0
+                if stage4_on_cpu:
+                    upload_t = (math.ceil(tile_t / ft) + 1
+                                + math.ceil(natten_trailing_pad_latent_frames * VIDEO_SCALE_FACTORS.time / ft))
+                    upload_bytes = (upload_t * math.ceil(tile_h / fh) * math.ceil(tile_w / fw)
+                                    * stage4_channels * element_size)
+                candidate_max_tokens = int(
+                    (usable - acc_bytes - downstream_bytes - upload_bytes) // s5_bytes_per_token
+                ) if stage4_on_cpu else max_s5_tokens
+                stage5_tokens = _stage5_tokens_for_pixel_tile(
+                    tile_t,
+                    tile_h,
+                    tile_w,
+                    patch_size=patch_size,
+                )
+                if stage5_tokens > candidate_max_tokens:
+                    continue
+                if max_stage5_tokens is not None and stage5_tokens > int(max_stage5_tokens):
+                    continue
+                spatial_pixels = int(tile_h) * int(tile_w)
                 if (
-                    _stage5_tokens_for_pixel_tile(
-                        tile_t,
-                        tile_h,
-                        tile_w,
-                        patch_size=patch_size,
-                    )
-                    > max_s5_tokens
+                    max_stage5_spatial_pixels is not None
+                    and spatial_pixels > int(max_stage5_spatial_pixels)
                 ):
                     continue
-                waste = _volumetric_overlap_waste(
-                    num_frames=num_frames,
-                    height=height,
-                    width=width,
-                    tile_frames=tile_t,
-                    tile_height=tile_h,
-                    tile_width=tile_w,
-                    n_t=n_t,
-                    n_h=n_h,
-                    n_w=n_w,
-                )
-                scored.append((waste, -tile_t * tile_h * tile_w, n_t * n_h * n_w, tile_t, tile_h, tile_w))
+                if runtime_aware_scoring:
+                    (
+                        runtime_score,
+                        exact_work_ratio,
+                        exact_tile_count,
+                        exact_n_t,
+                        exact_n_h,
+                        exact_n_w,
+                        aspect_log,
+                    ) = _comfy_runtime_candidate_score(
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        tile_frames=tile_t,
+                        tile_height=tile_h,
+                        tile_width=tile_w,
+                        overlap_t=overlap_t,
+                        overlap_hw=overlap_hw,
+                        min_t_px=min_t_px,
+                        min_h_px=min_h_px,
+                        min_w_px=min_w_px,
+                    )
+                    # Runtime score dominates.  Exact work and tile count make
+                    # tie-breaking deterministic; larger safe tiles are preferred
+                    # only after the estimated runtime terms are equal.
+                    scored.append(
+                        (
+                            runtime_score,
+                            exact_work_ratio,
+                            exact_tile_count,
+                            exact_n_t,
+                            aspect_log,
+                            -tile_t * tile_h * tile_w,
+                            tile_t,
+                            tile_h,
+                            tile_w,
+                            exact_n_h,
+                            exact_n_w,
+                        )
+                    )
+                else:
+                    waste = _volumetric_overlap_waste(
+                        num_frames=num_frames,
+                        height=height,
+                        width=width,
+                        tile_frames=tile_t,
+                        tile_height=tile_h,
+                        tile_width=tile_w,
+                        n_t=n_t,
+                        n_h=n_h,
+                        n_w=n_w,
+                    )
+                    scored.append((waste, -tile_t * tile_h * tile_w, n_t * n_h * n_w, tile_t, tile_h, tile_w))
 
     if not scored:
         raise ValueError(
@@ -618,7 +773,37 @@ def recommended_chunked_eager_keyframe_decode_tiling_config(  # noqa: PLR0913
         )
 
     scored.sort()
-    _waste, _volume, _tile_count, tile_t, tile_h, tile_w = scored[0]
+    if runtime_aware_scoring:
+        (
+            runtime_score,
+            exact_work_ratio,
+            exact_tile_count,
+            exact_n_t,
+            aspect_log,
+            _volume,
+            tile_t,
+            tile_h,
+            tile_w,
+            exact_n_h,
+            exact_n_w,
+        ) = scored[0]
+        if selection_diagnostics is not None:
+            selection_diagnostics.clear()
+            selection_diagnostics.update(
+                mode="comfy_runtime_exact_work_v1",
+                runtime_score=float(runtime_score),
+                exact_work_ratio=float(exact_work_ratio),
+                total_tiles=int(exact_tile_count),
+                temporal_groups=int(exact_n_t),
+                height_tiles=int(exact_n_h),
+                width_tiles=int(exact_n_w),
+                spatial_aspect_ratio=float(math.exp(aspect_log)),
+            )
+    else:
+        _waste, _volume, _tile_count, tile_t, tile_h, tile_w = scored[0]
+        if selection_diagnostics is not None:
+            selection_diagnostics.clear()
+            selection_diagnostics.update(mode="official_nominal_overlap_waste")
     return TileSizeConfig(
         frames=DimensionSizeConfig(tile_size=tile_t, overlap=overlap_t),
         height=DimensionSizeConfig(tile_size=tile_h, overlap=overlap_hw),

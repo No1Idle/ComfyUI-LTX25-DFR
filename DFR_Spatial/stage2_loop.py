@@ -72,6 +72,7 @@ def _execute_stage2_av_whole_schedule(
         seed=shared_seed,
         collect_diagnostics=collect_diagnostics,
         profiler=None,
+        **({"memory_profile": True} if _model_looks_like_comfy_patcher(model) else {}),
     )
 
 

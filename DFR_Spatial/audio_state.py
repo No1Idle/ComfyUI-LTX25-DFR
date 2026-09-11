@@ -348,6 +348,17 @@ def validate_audio_state_against_video(audio_official_state: dict[str, Any], vid
     expected_pixel_frames = _video_pixel_frames_from_state(video_official_state)
     expected_fps = _video_fps_from_state(video_official_state)
     expected_duration = float(expected_pixel_frames) / float(expected_fps)
+    video_duration = expected_duration
+    alignment = audio_state.get("video_alignment", {})
+    if alignment.get("mode") == "preserved_stage1_audio":
+        import math
+        if (alignment.get("stage") != 2 or alignment.get("pixel_frames") != expected_pixel_frames
+                or float(alignment.get("fps", 0)) != expected_fps):
+            raise ValueError("Preserved Stage-2 audio metadata does not match the current video canvas")
+        expected_duration = float(alignment.get("source_duration_seconds", 0))
+        if not math.isfinite(expected_duration) or expected_duration <= 0:
+            raise ValueError("Preserved Stage-2 audio requires a positive source duration")
+
     expected_frames = _audio_frames_from_duration(
         duration=expected_duration,
         sample_rate=int(token_state["sample_rate"]),
@@ -368,7 +379,7 @@ def validate_audio_state_against_video(audio_official_state: dict[str, Any], vid
         shift=int(token_state["shift"]),
         device=token_state["positions"].device,
     )
-    position_error = float((token_state["positions"] - expected_pos).abs().max().item()) if expected_pos.numel() else 0.0
+    position_error = (float((token_state["positions"] - expected_pos).abs().max().item()) if expected_pos.numel() else 0.0) if token_state["positions"].shape == expected_pos.shape else 1.0
     duration_error = abs(float(audio_state["duration_seconds"]) - expected_duration)
     token_shape_expected = (actual_shape[0], expected_frames, actual_shape[1] * actual_shape[3])
     token_shape_error = 0.0 if tuple(int(x) for x in token_state["latent"].shape) == token_shape_expected else 1.0
@@ -396,6 +407,7 @@ def validate_audio_state_against_video(audio_official_state: dict[str, Any], vid
         "token_shape": tuple(int(x) for x in token_state["latent"].shape),
         "expected_token_shape": token_shape_expected,
         "expected_duration": expected_duration,
+        "video_duration": video_duration,
         "pixel_frames": expected_pixel_frames,
         "fps": expected_fps,
     }

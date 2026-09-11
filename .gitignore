@@ -3,3 +3,4 @@ tests/
 *.py[cod]
 .pytest_cache/
 .codex
+analysis/

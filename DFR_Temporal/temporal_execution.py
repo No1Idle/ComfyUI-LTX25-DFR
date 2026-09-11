@@ -8,6 +8,8 @@ transitions, stitching, and carry-forward keyframes.
 from __future__ import annotations
 
 from typing import Any
+from contextlib import ExitStack
+import logging
 
 import torch
 
@@ -57,6 +59,17 @@ else:  # Standalone temporal regression tests.
         extract_official_generated_keyframes,
     )
     from DFR_Spatial.latent_state import get_official_state
+
+if "." in (__package__ or ""):
+    from ..DFR_Spatial.compact_timestep import stage2_compact_timestep
+    from ..DFR_Spatial.output_chunking import stage2_output_chunking
+    from ..DFR_Spatial.feed_forward_chunking import stage2_feed_forward_chunking
+    from ..DFR_Spatial.memory_profile import SamplerMemoryProfile
+else:
+    from DFR_Spatial.compact_timestep import stage2_compact_timestep
+    from DFR_Spatial.output_chunking import stage2_output_chunking
+    from DFR_Spatial.feed_forward_chunking import stage2_feed_forward_chunking
+    from DFR_Spatial.memory_profile import SamplerMemoryProfile
 
 from .temporal_ancestral import (
     draw_temporal_ancestral_noise,
@@ -139,6 +152,8 @@ def _execute_temporal_tile_comfy(
     loaded_models = None
     processed_conds = None
 
+    memory = SamplerMemoryProfile(True, getattr(model, "load_device", initial_packed.device), model, label="Temporal")
+    memory.snapshot("before model load")
     try:
         real_model, _, loaded_models = sampler_helpers.prepare_sampling(
             model,
@@ -165,12 +180,14 @@ def _execute_temporal_tile_comfy(
         )
         real_model.latent_shapes = latent_shapes
         model.pre_run()
+        memory.snapshot("after model load")
         step_noise_generator = make_temporal_ancestral_generator(
             int(ancestral_noise_seed),
             torch.device(load_device),
         )
 
         for step_index in range(int(sigma_schedule.numel() - 1)):
+            memory.start_step()
             _set_working_stage1_av_latents(
                 working_video,
                 working_audio,
@@ -249,6 +266,7 @@ def _execute_temporal_tile_comfy(
                 sigma_next=sigma_next,
                 noise=audio_noise,
             )
+            memory.end_step(step_index)
     finally:
         cleanup_conds = processed_conds if processed_conds is not None else conds_for_loading
         if loaded_models is not None:
@@ -562,6 +580,9 @@ def run_temporal_dfr_round(
     anchor_strength: float = ANCHOR_KEYFRAME_STRENGTH,
     carry_refined_anchors: bool = False,
     device: torch.device | None = None,
+    compact_timesteps: bool = True,
+    output_chunk_tokens: int = 4096,
+    ff_chunk_tokens: int = 4096,
 ) -> DFRTemporalHandoff:
     """Execute one complete x2 temporal round and return the next handoff."""
     source = require_temporal_handoff(temporal_handoff)
@@ -604,21 +625,31 @@ def run_temporal_dfr_round(
             generator,
             device=target_device,
         )
-        final_video, _final_audio = _execute_temporal_tile(
-            model,
-            positive,
-            negative,
-            noised_video,
-            frozen_audio,
-            sigma_schedule,
-            float(cfg_scale),
-            int(source.seed),
-            temporal_ancestral_noise_seed(
+        # Scope patches to this tile's sampling lifecycle; never the upsampler,
+        # decoder or stitching. The direct oracle backend remains unchanged.
+        with ExitStack() as optimizations:
+            if _model_looks_like_comfy_patcher(model):
+                logging.info("[LTX DFR Temporal memory] round %d tile %d/%d; compact=%s; output_chunk=%d; ff_chunk=%d",
+                             upscaled.round_index, tile_index + 1, len(plan.tiles), compact_timesteps,
+                             output_chunk_tokens, ff_chunk_tokens)
+                optimizations.enter_context(stage2_compact_timestep(model, compact_timesteps))
+                optimizations.enter_context(stage2_output_chunking(model, output_chunk_tokens))
+                optimizations.enter_context(stage2_feed_forward_chunking(model, ff_chunk_tokens))
+            final_video, _final_audio = _execute_temporal_tile(
+                model,
+                positive,
+                negative,
+                noised_video,
+                frozen_audio,
+                sigma_schedule,
+                float(cfg_scale),
                 int(source.seed),
-                int(upscaled.round_index),
-                int(tile_index),
-            ),
-        )
+                temporal_ancestral_noise_seed(
+                    int(source.seed),
+                    int(upscaled.round_index),
+                    int(tile_index),
+                ),
+            )
         base = extract_official_base_latent(final_video)["samples"]
         tile_latents.append(base[:, :, int(window.interval.left_ramp) :])
         if carry_refined_anchors and window.anchor_global:

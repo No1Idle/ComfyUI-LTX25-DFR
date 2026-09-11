@@ -15,7 +15,10 @@ continued post-Stage2 generator.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
+import logging
+import math
 from typing import Any
 
 import torch
@@ -62,6 +65,8 @@ from .decoder_official_tiling import (
     _weight_floor,
 )
 
+
+logger = logging.getLogger(__name__)
 
 C26B_SCHEDULE_VERSION = 2
 C26B_EXECUTION_VERSION = 2
@@ -183,6 +188,33 @@ def _module_state_bytes(module: Any) -> int:
     return sum(int(t.nbytes) for t in module.state_dict().values() if torch.is_tensor(t))
 
 
+# Empirical peak guardrails for the width_chunks=1 Comfy decoder.
+# Reference 12-GiB measurements: 104x416x640 runs normally, while
+# 104x480x640 crosses the severe memory-pressure cliff.
+_COMFY_STAGE5_TOKENS_AT_12_GIB = 1_730_560
+_COMFY_STAGE5_TOKEN_REFERENCE_BYTES = 12 * (1 << 30)
+# Separate spatial guard: 266,240 pixels worked; 301,056/307,200 did not.
+_COMFY_STAGE5_SPATIAL_PIXELS_AT_12_GIB = 270_000
+
+
+def _comfy_stage5_token_guardrail(total_memory: int) -> int:
+    scaled = int(
+        _COMFY_STAGE5_TOKENS_AT_12_GIB
+        * max(1, int(total_memory))
+        / _COMFY_STAGE5_TOKEN_REFERENCE_BYTES
+    )
+    return max(1, scaled)
+
+
+def _comfy_stage5_spatial_guardrail(total_memory: int) -> int:
+    scaled = int(
+        _COMFY_STAGE5_SPATIAL_PIXELS_AT_12_GIB
+        * max(1, int(total_memory))
+        / _COMFY_STAGE5_TOKEN_REFERENCE_BYTES
+    )
+    return max(1, scaled)
+
+
 def _module_resident_bytes(module: Any, device: torch.device) -> int:
     total = 0
     for tensor in module.state_dict().values():
@@ -206,7 +238,7 @@ def _comfy_auto_tiling_free_bytes(
     are credited back before the unchanged official budget formula subtracts
     them.  Other live tensors remain charged.
     """
-    device = stage4_video.device
+    device = torch.device(vae.device)
     if device.type != "cuda":
         raise ValueError(
             "Automatic DiffVAE tiling currently requires a CUDA Stage-4 execution. "
@@ -230,7 +262,8 @@ def _comfy_auto_tiling_free_bytes(
             resident_decoder,
             min(int(decoder_model_bytes), max(0, int(loaded_size()))),
         )
-    resident_stage4 = int(stage4_video.numel()) * int(stage4_video.element_size())
+    resident_stage4 = (int(stage4_video.numel()) * int(stage4_video.element_size())
+                       if stage4_video.device == device else 0)
     planning_free = min(total_memory, current_free + resident_decoder + resident_stage4)
     return planning_free, current_free, total_memory, resident_decoder, resident_stage4
 
@@ -413,8 +446,13 @@ def prepare_official_auto_tiled_decode_schedule(
     vae: Any,
     deterministic_execution: DFRDeterministicStageExecution,
     deterministic_context: DFRDeterministicDecoderKeyframeContext,
+    *,
+    auto_tile_multiplier: float = 1.0,
 ) -> tuple[DFROfficialTiledDecodeSchedule, str]:
     """Select the official memory-aware config, then build the C26b schedule."""
+    auto_tile_multiplier = float(auto_tile_multiplier)
+    if not math.isfinite(auto_tile_multiplier) or not 0.1 <= auto_tile_multiplier <= 2.0:
+        raise ValueError("auto_tile_multiplier must be between 0.1 and 2.0")
     if not isinstance(deterministic_execution, DFRDeterministicStageExecution):
         raise ValueError(
             f"Expected DFRDeterministicStageExecution, got {type(deterministic_execution).__name__}."
@@ -458,7 +496,20 @@ def prepare_official_auto_tiled_decode_schedule(
         stage4_video,
         decoder_model_bytes=decoder_model_bytes,
     )
+    comfy_stage5_token_cap = (
+        max(1, int(_comfy_stage5_token_guardrail(total_memory) * auto_tile_multiplier))
+        if stage4_video.device.type == "cpu"
+        else None
+    )
+    comfy_stage5_spatial_pixel_cap = (
+        max(1, int(_comfy_stage5_spatial_guardrail(total_memory) * auto_tile_multiplier))
+        if stage4_video.device.type == "cpu"
+        else None
+    )
 
+    logger.info("[LTX DFR decode autotile] multiplier=%.2f; token_cap=%s; spatial_pixel_cap=%s",
+                auto_tile_multiplier, comfy_stage5_token_cap, comfy_stage5_spatial_pixel_cap)
+    runtime_rank: dict[str, float | int | str] = {}
     config = recommended_chunked_eager_keyframe_decode_tiling_config(
         tile_halos=tile_halos,
         pixel_scale=pixel_scale,
@@ -475,6 +526,11 @@ def prepare_official_auto_tiled_decode_schedule(
         element_size=element_size,
         natten_trailing_pad_latent_frames=int(deterministic_execution.ghost_pad_latent_frames),
         out_channels=int(decoder.out_channels),
+        stage4_on_cpu=stage4_video.device.type == "cpu",
+        max_stage5_tokens=comfy_stage5_token_cap,
+        max_stage5_spatial_pixels=comfy_stage5_spatial_pixel_cap,
+        runtime_aware_scoring=stage4_video.device.type == "cpu",
+        selection_diagnostics=runtime_rank,
     )
     state, manual_report = prepare_official_tiled_decode_schedule(
         vae,
@@ -487,6 +543,20 @@ def prepare_official_auto_tiled_decode_schedule(
         spatial_overlap=int(config.height.overlap),
     )
 
+    if runtime_rank.get("mode") == "comfy_runtime_exact_work_v1":
+        logger.info(
+            "[LTX DFR decode autotile rank] exact_work=%.3fx; score=%.3f; grid=%dx%dx%d; "
+            "spatial_aspect=%.2f; safe_caps=(tokens=%s, spatial_pixels=%s)",
+            float(runtime_rank["exact_work_ratio"]),
+            float(runtime_rank["runtime_score"]),
+            int(runtime_rank["temporal_groups"]),
+            int(runtime_rank["height_tiles"]),
+            int(runtime_rank["width_tiles"]),
+            float(runtime_rank["spatial_aspect_ratio"]),
+            str(comfy_stage5_token_cap),
+            str(comfy_stage5_spatial_pixel_cap),
+        )
+
     gib = float(1 << 30)
     report = (
         "PASS=True; stage=U3.4b5_auto_official_tiled_schedule; "
@@ -495,6 +565,9 @@ def prepare_official_auto_tiled_decode_schedule(
         f"total_gib={total_memory / gib:.3f}; decoder_model_gib={decoder_model_bytes / gib:.3f}; "
         f"resident_decoder_credit_gib={resident_decoder / gib:.3f}; "
         f"resident_stage4_credit_gib={resident_stage4 / gib:.3f}; planning_free_gib={planning_free / gib:.3f}; "
+        f"comfy_stage5_token_cap={comfy_stage5_token_cap}; "
+        f"comfy_stage5_spatial_pixel_cap={comfy_stage5_spatial_pixel_cap}; "
+        f"auto_tile_multiplier={auto_tile_multiplier}; runtime_rank={runtime_rank}; "
         f"selected=(frames={config.frames.tile_size}/{config.frames.overlap},"
         f"height={config.height.tile_size}/{config.height.overlap},"
         f"width={config.width.tile_size}/{config.width.overlap}); "
@@ -531,6 +604,7 @@ def execute_official_tiled_decode(
     schedule: DFROfficialTiledDecodeSchedule,
     *,
     collect_diagnostics: bool = True,
+    timings: Any = None,
 ) -> tuple[torch.Tensor, DFROfficialTiledDecodeExecution | None, str]:
     if not isinstance(decoder_handoff, DFRStage2DecoderHandoff):
         raise ValueError(f"Expected DFRStage2DecoderHandoff, got {type(decoder_handoff).__name__}.")
@@ -560,11 +634,12 @@ def execute_official_tiled_decode(
     if tuple(strides[3]) != schedule.upsample3_stride or int(patch_size) != int(schedule.patch_size):
         raise ValueError("Loaded VAE Stage-4 upsample/patch geometry changed since schedule preparation.")
 
+    phase = timings.phase if timings is not None else lambda name: nullcontext()
     device = vae.device
     dtype = vae.vae_dtype
-    feat_s4 = deterministic_execution.stage4_input_video.to(device=device, dtype=dtype)
-    key_s4 = deterministic_execution.stage4_input_keyframes.to(device=device, dtype=dtype)
-    valid_all = deterministic_execution.stage4_input_valid.to(device=device, dtype=torch.bool)
+    feat_s4 = deterministic_execution.stage4_input_video
+    key_s4 = deterministic_execution.stage4_input_keyframes
+    valid_all = deterministic_execution.stage4_input_valid
     pixel_indices_all = torch.tensor(deterministic_context.keyframe_pixel_frame_indices, dtype=torch.long, device="cpu")
     remaining = tuple(int(v) for v in deterministic_context.temporal_scale_schedule)
     content_s4_frames = int(schedule.content_stage4_shape[0])
@@ -602,7 +677,7 @@ def execute_official_tiled_decode(
     actual_plane_sets: list[tuple[int, ...]] = []
     stage4_origins: list[float] = []
     pixel_origins: list[float] = []
-    accum_dtype = torch.float16 if feat_s4.dtype == torch.bfloat16 else feat_s4.dtype
+    accum_dtype = torch.float16 if dtype == torch.bfloat16 else dtype
     randn_device = generator.device
 
     def _emit(buf: torch.Tensor, wts: torch.Tensor | None, global_start: int) -> tuple[int, int] | None:
@@ -611,19 +686,20 @@ def execute_official_tiled_decode(
         frames_keep = min(int(buf.shape[2]), int(full_shape[2]) - int(global_start))
         if frames_keep < 1:
             return None
-        chunk = buf[:, :, :frames_keep]
-        if wts is not None:
-            floor = _weight_floor(wts.dtype)
-            chunk = chunk / wts[:, :, :frames_keep].clamp(min=floor)
-        chunk = crop_pixels_to_content(chunk.to(dtype), frames_keep, full_shape[3], full_shape[4])
-        # Frozen decode_video wrapper: BFHWC then in-place [-1,1] -> [0,1].
-        # Copy completed frames directly to ComfyUI's normal output device so
-        # temporal groups do not accumulate as full-resolution CUDA tensors.
-        bfhwc = chunk.permute(0, 2, 3, 4, 1).contiguous()
-        bfhwc.add_(1).mul_(0.5).clamp_(0, 1)
-        for batch_index in range(full_shape[0]):
-            output_start = batch_index * full_shape[2] + global_start
-            image[output_start : output_start + frames_keep].copy_(bfhwc[batch_index])
+        with phase("output_transfer"):
+            chunk = buf[:, :, :frames_keep]
+            if wts is not None:
+                floor = _weight_floor(wts.dtype)
+                chunk = chunk / wts[:, :, :frames_keep].clamp(min=floor)
+            chunk = crop_pixels_to_content(chunk.to(dtype), frames_keep, full_shape[3], full_shape[4])
+            # Frozen decode_video wrapper: BFHWC then in-place [-1,1] -> [0,1].
+            # Copy completed frames directly to ComfyUI's normal output device so
+            # temporal groups do not accumulate as full-resolution CUDA tensors.
+            bfhwc = chunk.permute(0, 2, 3, 4, 1).contiguous()
+            bfhwc.add_(1).mul_(0.5).clamp_(0, 1)
+            for batch_index in range(full_shape[0]):
+                output_start = batch_index * full_shape[2] + global_start
+                image[output_start : output_start + frames_keep].copy_(bfhwc[batch_index])
         return int(global_start), int(global_start + frames_keep)
 
     with model_management.cuda_device_context(device), torch.inference_mode():
@@ -639,6 +715,9 @@ def execute_official_tiled_decode(
                 feat_tile, is_origin, pad_trailing, content_thw = slice_stage4_tile(
                     feat_s4, tile, content_frames=content_s4_frames
                 )
+                # Slice on the storage device before transfer; never upload the full CPU feature.
+                with phase("tile_upload"):
+                    feat_tile = feat_tile.to(device=device, dtype=dtype)
                 stage4_origin = tile.in_coords[1].indices(content_s4_frames)[0]
                 pixel_lo, pixel_hi, _ = tile.out_coords[2].indices(full_shape[2])
                 keep_cpu = planes_for_tile_official(pixel_indices_all, pixel_lo, pixel_hi - 1, clip_start_frame=0)
@@ -652,10 +731,17 @@ def execute_official_tiled_decode(
                     stage4_origins.append(float(stage4_origin))
                     pixel_origins.append(float(pixel_lo))
 
-                keep_dev = keep_cpu.to(device=key_s4.device)
-                # Exact KeyframeStream.select_planes(...).crop_spatial(...).
-                tile_key_x = key_s4[:, keep_dev, tile.in_coords[2], tile.in_coords[3], :]
-                tile_valid = valid_all[keep_dev]
+                keep_storage = keep_cpu.to(device=key_s4.device)
+                # Exact KeyframeStream.select_planes(...).crop_spatial(...). Slice
+                # on the storage device first so the complete keyframe Stage-4
+                # volume is never uploaded to CUDA.
+                with phase("tile_upload"):
+                    tile_key_x = key_s4[
+                        :, keep_storage, tile.in_coords[2], tile.in_coords[3], :
+                    ].to(device=device, dtype=dtype)
+                    tile_valid = valid_all[
+                        keep_cpu.to(device=valid_all.device)
+                    ].to(device=device, dtype=torch.bool)
                 stage4_times = keyframe_clip_times_official(
                     tile_indices,
                     remaining[3],
@@ -666,15 +752,17 @@ def execute_official_tiled_decode(
 
                 # Frozen CHUNKED_EAGER Stage 4: blocks only.  The last
                 # pixel-shuffle is deferred into each Stage-5 block.
-                context_tile, stage4_stream = _run_det_stage_blocks_with_keyframes_exact(
-                    comfy_na,
-                    comfy_kitchen,
-                    decoder,
-                    feat_tile,
-                    tile_stream,
-                    3,
-                    num_slots=int(stage5_port.num_slots),
-                )
+                with phase("stage4"):
+                    context_tile, stage4_stream = _run_det_stage_blocks_with_keyframes_exact(
+                        comfy_na,
+                        comfy_kitchen,
+                        decoder,
+                        feat_tile,
+                        tile_stream,
+                        3,
+                        num_slots=int(stage5_port.num_slots),
+                    )
+                del feat_tile
                 if pad_trailing:
                     up_t = int(strides[3][0])
                     context_tile = crop_trailing_context_natten_pad(
@@ -718,34 +806,36 @@ def execute_official_tiled_decode(
                     device=randn_device,
                 ).to(device)
 
-                video_x, keyframe_x = build_deferred_stage5_inputs_exact(
-                    comfy_na,
-                    decoder,
-                    context_tile,
-                    stage5_stream.x,
-                    video_x_t,
-                    keyframe_x_t,
-                    stage5_stream.valid,
-                    drop_leading_frame=bool(is_origin),
-                )
-                t_now = timesteps.to(device=device)[0].expand(batch)
-                pixel_tile, _keyframe_pred, _invalid_zero, blocks_executed = forward_stage5_chunked_step_exact(
-                    comfy_na,
-                    comfy_kitchen,
-                    decoder,
-                    video_x,
-                    context_tile,
-                    keyframe_x,
-                    stage5_stream.x,
-                    t_now,
-                    stage5_stream.times,
-                    stage5_stream.valid,
-                    drop_leading_frame=bool(is_origin),
-                    num_slots=int(stage5_port.num_slots),
-                    w_chunks=OFFICIAL_STAGE5_W_CHUNKS,
-                    collect_diagnostics=collect_diagnostics,
-                    return_keyframes=collect_diagnostics,
-                )
+                with phase("stage5"):
+                    video_x, keyframe_x = build_deferred_stage5_inputs_exact(
+                        comfy_na,
+                        decoder,
+                        context_tile,
+                        stage5_stream.x,
+                        video_x_t,
+                        keyframe_x_t,
+                        stage5_stream.valid,
+                        drop_leading_frame=bool(is_origin),
+                    )
+                    t_now = timesteps.to(device=device)[0].expand(batch)
+                    pixel_tile, _keyframe_pred, _invalid_zero, blocks_executed = forward_stage5_chunked_step_exact(
+                        comfy_na,
+                        comfy_kitchen,
+                        decoder,
+                        video_x,
+                        context_tile,
+                        keyframe_x,
+                        stage5_stream.x,
+                        t_now,
+                        stage5_stream.times,
+                        stage5_stream.valid,
+                        drop_leading_frame=bool(is_origin),
+                        num_slots=int(stage5_port.num_slots),
+                        w_chunks=OFFICIAL_STAGE5_W_CHUNKS,
+                        collect_diagnostics=collect_diagnostics,
+                        return_keyframes=collect_diagnostics,
+                        timings=timings,
+                    )
                 blocks_total += int(blocks_executed)
                 rendered_tiles += 1
                 # Do not carry a completed tile's large Stage-5 hidden buffers
@@ -761,28 +851,29 @@ def execute_official_tiled_decode(
                     stage5_stream,
                 )
 
-                content_pixel_shape = pixel_tile_shape(full_shape, tile.out_coords)
-                pixel_tile = crop_pixels_to_content(
-                    pixel_tile,
-                    content_pixel_shape[2],
-                    content_pixel_shape[3],
-                    content_pixel_shape[4],
-                ).to(buffer.dtype)
+                with phase("tile_blending"):
+                    content_pixel_shape = pixel_tile_shape(full_shape, tile.out_coords)
+                    pixel_tile = crop_pixels_to_content(
+                        pixel_tile,
+                        content_pixel_shape[2],
+                        content_pixel_shape[3],
+                        content_pixel_shape[4],
+                    ).to(buffer.dtype)
 
-                masks = tuple(m.to(device=buffer.device, dtype=torch.float32) for m in tile.masks_1d)
-                local_coords = (
-                    tile.out_coords[0],
-                    tile.out_coords[1],
-                    local_temporal_slice,
-                    tile.out_coords[3],
-                    tile.out_coords[4],
-                )
-                buffer[local_coords] += scale_by_masks_1d(pixel_tile, masks)
-                if weights is not None:
-                    strength = torch.ones(pixel_tile.shape, device=buffer.device, dtype=buffer.dtype)
-                    weights[local_coords] += scale_by_masks_1d(strength, masks)
-                    del strength
-                del pixel_tile, masks
+                    masks = tuple(m.to(device=buffer.device, dtype=torch.float32) for m in tile.masks_1d)
+                    local_coords = (
+                        tile.out_coords[0],
+                        tile.out_coords[1],
+                        local_temporal_slice,
+                        tile.out_coords[3],
+                        tile.out_coords[4],
+                    )
+                    buffer[local_coords] += scale_by_masks_1d(pixel_tile, masks)
+                    if weights is not None:
+                        strength = torch.ones(pixel_tile.shape, device=buffer.device, dtype=buffer.dtype)
+                        weights[local_coords] += scale_by_masks_1d(strength, masks)
+                        del strength
+                    del pixel_tile, masks
 
             rendered_groups += 1
             if overlap_stub is not None:

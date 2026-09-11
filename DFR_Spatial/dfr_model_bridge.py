@@ -36,9 +36,38 @@ import torch
 
 from .dfr_noiser import NOISER_METADATA_KEY
 from .latent_state import get_official_state
+from .frame_rate import official_conditioning_fps, model_video_positions
 
 
 BRIDGE_VERSION = 1
+
+
+def materialize_video_tokens_with_layout(tokens: torch.Tensor, layout: "DFRComfyModelInput") -> torch.Tensor:
+    """Repack changing tokens using already-validated, immutable loop geometry.
+
+    Masks, positions and operation metadata are built once by the full bridge.
+    Sparse reference holes remain zero, exactly as in that bridge.
+    """
+    b, c, _, h, w = layout.x.shape
+    expected = layout.total_tokens_after_filter
+    if tuple(tokens.shape) != (b, expected, c):
+        raise ValueError(f"Token geometry changed: {tuple(tokens.shape)}, expected {(b, expected, c)}.")
+    cursor = layout.base_frames * h * w
+    groups = [_unpatchify_tokens(tokens[:, :cursor], layout.base_frames, h, w)]
+    for op in layout.operation_frames:
+        frames = int(op["materialized_frames"])
+        sh, sw = int(op["source_height"]), int(op["source_width"])
+        count = frames * sh * sw
+        group = _unpatchify_tokens(tokens[:, cursor:cursor + count], frames, sh, sw)
+        cursor += count
+        if op["sparse"]:
+            expanded = tokens.new_zeros((b, c, frames, h, w))
+            expanded[..., ::h // sh, ::w // sw] = group
+            group = expanded
+        groups.append(group)
+    if cursor != expected:
+        raise ValueError("Cached operation layout did not consume all video tokens.")
+    return torch.cat(groups, dim=2)
 
 
 @dataclass
@@ -316,7 +345,7 @@ def materialize_comfy_model_input(noised_official_state: dict[str, Any]) -> DFRC
         denoise_mask=denoise_mask,
         keyframe_idxs=keyframe_idxs,
         generated_keyframes=generated_meta,
-        frame_rate=fps,
+        frame_rate=official_conditioning_fps(fps),
         base_frames=base_t,
         appended_frames=cursor_frame - base_t,
         appended_tokens_before_filter=appended_before_filter,
@@ -408,6 +437,8 @@ def validate_model_input_roundtrip(noised_official_state: dict[str, Any], model_
     expected_latent = token_state["latent"].to(device=emu["tokens"].device, dtype=emu["tokens"].dtype)
     expected_mask = token_state["denoise_mask"].to(device=emu["denoise_mask"].device, dtype=emu["denoise_mask"].dtype)
     expected_positions = token_state["positions"].to(device=emu["positions"].device, dtype=emu["positions"].dtype)
+    state_fps = float(token_state.get("fps") or state.get("fps") or 24.0)
+    expected_positions = model_video_positions(expected_positions, state_fps)
     expected_timesteps = expected_mask[..., 0] * float(sigma)
 
     if emu["tokens"].shape != expected_latent.shape:

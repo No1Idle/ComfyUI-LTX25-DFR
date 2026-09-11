@@ -26,6 +26,9 @@ class DFRStage2ResultHandoff:
     decoder_handoff: DFRStage2DecoderHandoff
     sigma_schedule: torch.Tensor
     used_official_sigmas: bool
+    temporal_seams: tuple[int, ...] = ()
+    temporal_tiles: int = 1
+    dfr_layout: dict[str, Any] | None = None
 
 
 def require_stage2_result_handoff(value: Any) -> DFRStage2ResultHandoff:
@@ -75,5 +78,8 @@ def prepare_stage2_result_handoff(
         decoder_handoff=decoder_handoff,
         sigma_schedule=sigma_schedule.detach().to(device="cpu", dtype=torch.float32).clone(),
         used_official_sigmas=bool(used_official_sigmas),
+        temporal_seams=tuple(getattr(upstream.stage_1_handoff, "temporal_seams", ())),
+        temporal_tiles=int(getattr(upstream.stage_1_handoff, "temporal_tiles", 1)),
+        dfr_layout=(dict(upstream.stage_1_handoff.dfr_layout) if getattr(upstream.stage_1_handoff, "dfr_layout", None) is not None else None),
     )
     return require_stage2_result_handoff(result)

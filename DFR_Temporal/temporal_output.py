@@ -189,6 +189,8 @@ def decode_temporal_dfr_video(  # noqa: PLR0913
     tile_frames: int = 104,
     tile_height: int = 416,
     tile_width: int = 544,
+    attention_chunks: int = 1,
+    auto_tile_multiplier: float = 1.0,
 ) -> torch.Tensor:
     """Run the validated keyframe-aware DiffVAE on a final temporal result."""
     handoff = require_temporal_handoff(temporal_handoff)
@@ -208,6 +210,8 @@ def decode_temporal_dfr_video(  # noqa: PLR0913
         tile_frames=int(tile_frames),
         tile_height=int(tile_height),
         tile_width=int(tile_width),
+        attention_chunks=attention_chunks,
+        auto_tile_multiplier=auto_tile_multiplier,
         log_stage=_temporal_decode_log_stage(handoff),
     )
 

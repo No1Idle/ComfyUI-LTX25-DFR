@@ -200,6 +200,9 @@ class LTXRunTemporalDFRRoundEulerPreview:
                 ),
             },
             "optional": {
+                "compact_timesteps": ("BOOLEAN", {"default": True, "tooltip": "Compact repeated video timestep embeddings within each tile. Frozen audio and timestep values are preserved."}),
+                "output_chunk_tokens": ("INT", {"default": 4096, "min": 0, "max": 65536, "step": 1024, "tooltip": "Chunk video output modulation/projection per tile. 0 disables."}),
+                "ff_chunk_tokens": ("INT", {"default": 4096, "min": 0, "max": 65536, "step": 1024, "tooltip": "Chunk video feed-forward layers per tile. 0 disables."}),
                 "negative": (
                     "CONDITIONING",
                     {"tooltip": "Optional Comfy CFG extension; unused at cfg_scale=1.0."},
@@ -241,6 +244,9 @@ class LTXRunTemporalDFRRoundEulerPreview:
         carry_refined_anchors=False,
         negative=None,
         sigmas=None,
+        compact_timesteps=True,
+        output_chunk_tokens=4096,
+        ff_chunk_tokens=4096,
     ):
         return (
             run_temporal_dfr_round(
@@ -254,6 +260,9 @@ class LTXRunTemporalDFRRoundEulerPreview:
                 cfg_scale=float(cfg_scale),
                 anchor_strength=float(anchor_strength),
                 carry_refined_anchors=bool(carry_refined_anchors),
+                compact_timesteps=bool(compact_timesteps),
+                output_chunk_tokens=int(output_chunk_tokens),
+                ff_chunk_tokens=int(ff_chunk_tokens),
             ),
         )
 
@@ -469,6 +478,10 @@ class LTXTemporalDFRVideoDecode:
                         "tooltip": "Manual mode only. Spatial overlap is derived internally.",
                     },
                 ),
+                "attention_chunks": ("INT", {"default": 1, "min": 1, "max": 4, "step": 1,
+                    "tooltip": "Allowed: 1, 2, or 4. One is fastest in measured runs; 2/4 reduce attention workspace. Independent of auto/manual tiling."}),
+                "auto_tile_multiplier": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 2.0, "step": 0.05,
+                    "tooltip": "Auto tiling only. Multiplies both computed tile caps. 1.0 preserves current behavior; below 1 uses smaller limits; above 1 allows larger tiles. Existing memory checks still apply."}),
             }
         }
 
@@ -492,6 +505,8 @@ class LTXTemporalDFRVideoDecode:
         tile_frames=104,
         tile_height=416,
         tile_width=544,
+        attention_chunks=1,
+        auto_tile_multiplier=1.0,
     ):
         return (
             decode_temporal_dfr_video(
@@ -503,6 +518,8 @@ class LTXTemporalDFRVideoDecode:
                 tile_frames=int(tile_frames),
                 tile_height=int(tile_height),
                 tile_width=int(tile_width),
+                attention_chunks=attention_chunks,
+                auto_tile_multiplier=auto_tile_multiplier,
             ),
         )
 

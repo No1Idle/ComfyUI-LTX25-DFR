@@ -20,6 +20,8 @@ EXPERIMENTAL_DENSE_SLOT_LAYOUT_KIND = "experimental_dense_generated_slots_16"
 EXPERIMENTAL_DENSE_SLOT_SEGMENT = 16
 CUSTOM_GENERATED_SLOT_LAYOUT_VERSION = 3
 CUSTOM_GENERATED_SLOT_LAYOUT_KIND = "custom_generated_slots"
+CONTINUATION_LAYOUT_VERSION = 4
+CONTINUATION_LAYOUT_KIND = "continuation_canvas"
 
 
 def padding_to_segment(content_frames: int, segment: int) -> int:
@@ -211,11 +213,32 @@ def make_experimental_dense_slot_layout(
     }
 
 
+def make_continuation_layout(requested_frames, padded_frames, pixel_frame_indices, temporal_scale=8):
+    """Preserve an existing temporal canvas rather than selecting new padding."""
+    requested_frames, padded_frames, temporal_scale = map(int, (requested_frames, padded_frames, temporal_scale))
+    if temporal_scale < 1 or not 1 < requested_frames <= padded_frames:
+        raise ValueError("Invalid continuation frame counts or temporal scale")
+    if (requested_frames-1) % temporal_scale or (padded_frames-1) % temporal_scale:
+        raise ValueError("Continuation frame counts must lie on the latent grid")
+    positions = _validate_custom_generated_slot_indices(
+        pixel_frame_indices, padded_frames=padded_frames, temporal_scale=temporal_scale)
+    return dict(version=CONTINUATION_LAYOUT_VERSION, layout_kind=CONTINUATION_LAYOUT_KIND, requested_frames=requested_frames,
+                padded_frames=padded_frames, padding_frames=padded_frames-requested_frames,
+                segment_length=0, pixel_frame_indices=positions, temporal_scale=temporal_scale,
+                requested_latent_frames=(requested_frames-1)//temporal_scale+1,
+                padded_latent_frames=(padded_frames-1)//temporal_scale+1)
+
+
 def validate_layout(layout: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(layout, dict):
         raise ValueError(f"DFR layout must be a dict, got {type(layout).__name__}.")
     version = layout.get("version")
-    if version == DFR_LAYOUT_VERSION:
+    if version == CONTINUATION_LAYOUT_VERSION:
+        if layout.get("layout_kind") != CONTINUATION_LAYOUT_KIND:
+            raise ValueError("Invalid continuation layout kind")
+        reference = make_continuation_layout(layout["requested_frames"], layout["padded_frames"],
+                                             layout["pixel_frame_indices"], layout["temporal_scale"])
+    elif version == DFR_LAYOUT_VERSION:
         requested = int(layout["requested_frames"])
         temporal_scale = int(layout["temporal_scale"])
         reference = make_layout(requested, temporal_scale)
@@ -245,7 +268,7 @@ def validate_layout(layout: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"Unsupported DFR layout version {version}; expected official version {DFR_LAYOUT_VERSION}, "
             f"experimental version {EXPERIMENTAL_DENSE_SLOT_LAYOUT_VERSION}, "
-            f"or custom version {CUSTOM_GENERATED_SLOT_LAYOUT_VERSION}."
+            f"custom version {CUSTOM_GENERATED_SLOT_LAYOUT_VERSION}, or continuation version 4."
         )
     for key in (
         "padded_frames",
@@ -260,3 +283,12 @@ def validate_layout(layout: dict[str, Any]) -> dict[str, Any]:
                 f"Malformed DFR layout field {key}: got {layout.get(key)!r}, expected {reference[key]!r}."
             )
     return layout
+
+
+def layout_from_handoff(handoff):
+    """Get the authoritative layout carried through a spatial continuation."""
+    source = getattr(handoff, "stage_1_handoff", handoff)
+    layout = getattr(source, "dfr_layout", None)
+    if layout is None:
+        raise ValueError("This handoff has no embedded DFR layout. Rerun Stage 1 and the spatial upscaler, or supply the source layout to the modular upscaler.")
+    return dict(validate_layout(layout))

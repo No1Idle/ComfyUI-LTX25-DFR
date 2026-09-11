@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
+from .dfr_layout import validate_layout
 from typing import Any
 
 import torch
@@ -64,6 +66,8 @@ def run_stage1_spatial_dfr(
             base_latent,
             generated_keyframes,
         )
+    if video_official_state.get("dfr_layout") is not None:
+        handoff = replace(handoff, dfr_layout=dict(validate_layout(video_official_state["dfr_layout"])))
     if profiler.enabled:
         logging.warning("\n%s", profiler.format_report())
     return handoff
